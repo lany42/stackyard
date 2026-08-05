@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${repo_root}"
+
+# Keep the stricter checks that matter for pointer-heavy unsafe code.
+export MIRIFLAGS="${MIRIFLAGS:+${MIRIFLAGS} }\
+-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+
+echo "==> Miri with default features"
+cargo +nightly miri test --locked "$@"
+
+echo "==> Miri with no default features"
+cargo +nightly miri test --locked --no-default-features "$@"
