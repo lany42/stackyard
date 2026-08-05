@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
-use core::{mem::MaybeUninit, ptr};
+use core::{
+    borrow::{Borrow, BorrowMut},
+    cmp::Ordering,
+    convert::{AsMut, AsRef},
+    hash::{Hash, Hasher},
+    mem::MaybeUninit,
+    ops::{Deref, DerefMut, Index, IndexMut},
+    ptr,
+    slice::SliceIndex,
+};
 
 /// A stack for holding N of T
 pub struct Stack<T, const N: usize> {
@@ -197,6 +206,12 @@ impl<T, const N: usize> Stack<T, N> {
     }
 }
 
+impl<T, const N: usize> Default for Stack<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Clone, const N: usize> Clone for Stack<T, N> {
     fn clone(&self) -> Self {
         let mut new = Self::new();
@@ -206,8 +221,182 @@ impl<T: Clone, const N: usize> Clone for Stack<T, N> {
 }
 
 impl<T, const N: usize> Drop for Stack<T, N> {
+    #[inline]
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+impl<T: Hash, const N: usize> Hash for Stack<T, N> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl<T: PartialOrd, const N: usize, const M: usize> PartialOrd<Stack<T, M>> for Stack<T, N> {
+    #[inline]
+    fn partial_cmp(&self, other: &Stack<T, M>) -> Option<Ordering> {
+        self.as_slice().partial_cmp(other.as_slice())
+    }
+}
+
+impl<T: Ord, const N: usize> Ord for Stack<T, N> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl<T, U, const N: usize, const M: usize> PartialEq<Stack<U, M>> for Stack<T, N>
+where
+    T: PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &Stack<U, M>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T, U, const N: usize> PartialEq<[U]> for Stack<T, N>
+where
+    T: PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &[U]) -> bool {
+        self.as_slice().eq(other)
+    }
+}
+
+impl<T, U, const N: usize> PartialEq<&[U]> for Stack<T, N>
+where
+    T: PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &&[U]) -> bool {
+        self.as_slice().eq(*other)
+    }
+}
+
+impl<T, U, const N: usize, const M: usize> PartialEq<[U; M]> for Stack<T, N>
+where
+    T: PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &[U; M]) -> bool {
+        self.as_slice().eq(other.as_slice())
+    }
+}
+
+impl<T, U, const N: usize, const M: usize> PartialEq<&[U; M]> for Stack<T, N>
+where
+    T: PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &&[U; M]) -> bool {
+        self.as_slice().eq(other.as_slice())
+    }
+}
+
+impl<T: Eq, const N: usize> Eq for Stack<T, N> {}
+
+impl<T, I, const N: usize> Index<I> for Stack<T, N>
+where
+    I: SliceIndex<[T]>,
+{
+    type Output = I::Output;
+
+    #[inline]
+    fn index(&self, index: I) -> &Self::Output {
+        Index::index(self.as_slice(), index)
+    }
+}
+
+impl<T, I, const N: usize> IndexMut<I> for Stack<T, N>
+where
+    I: SliceIndex<[T]>,
+{
+    #[inline]
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        IndexMut::index_mut(self.as_mut_slice(), index)
+    }
+}
+
+impl<T, const N: usize> AsRef<[T]> for Stack<T, N> {
+    #[inline]
+    fn as_ref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T, const N: usize> AsMut<[T]> for Stack<T, N> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+
+impl<T, const N: usize> AsRef<Stack<T, N>> for Stack<T, N> {
+    #[inline]
+    fn as_ref(&self) -> &Stack<T, N> {
+        self
+    }
+}
+
+impl<T, const N: usize> AsMut<Stack<T, N>> for Stack<T, N> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut Stack<T, N> {
+        self
+    }
+}
+
+impl<T, const N: usize> Borrow<[T]> for Stack<T, N> {
+    #[inline]
+    fn borrow(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T, const N: usize> BorrowMut<[T]> for Stack<T, N> {
+    #[inline]
+    fn borrow_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+
+impl<T, const N: usize> Deref for Stack<T, N> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<T, const N: usize> DerefMut for Stack<T, N> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a Stack<T, N> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a mut Stack<T, N> {
+    type Item = &'a mut T;
+    type IntoIter = core::slice::IterMut<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
     }
 }
 
@@ -424,6 +613,37 @@ mod tests {
             CONST_METHOD_RESULTS,
             (1, None, Some(9), true, Some(7), true, true)
         );
+    }
+
+    // Explicit RHS references exercise the corresponding `PartialEq<&...>` impls.
+    #[allow(clippy::op_ref)]
+    #[test]
+    fn partial_eq_forwards_related_types_to_slices() {
+        struct Stored(u8);
+        struct Compared(u8);
+
+        impl PartialEq<Compared> for Stored {
+            fn eq(&self, other: &Compared) -> bool {
+                self.0 == other.0
+            }
+        }
+
+        let mut stack = Stack::<Stored, 4>::new();
+        for value in [1, 2, 3] {
+            assert!(stack.push(Stored(value)).is_none());
+        }
+
+        let array = [Compared(1), Compared(2), Compared(3)];
+        let slice = array.as_slice();
+
+        assert!(stack == *slice);
+        assert!(stack == slice);
+        assert!(stack == array);
+        assert!(stack == &array);
+
+        let different = [Compared(1), Compared(2), Compared(4)];
+        assert!(stack != different);
+        assert!(stack != &different[..2]);
     }
 
     #[test]

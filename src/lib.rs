@@ -6,3 +6,5 @@
 extern crate alloc;
 
 mod stack;
+
+pub use stack::Stack;
