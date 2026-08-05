@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
+//! Fixed-capacity stack storage.
+//!
+//! The [`Stack`] type keeps its elements inline, exposes its initialized
+//! contents as a slice, and returns values that cannot be pushed because the
+//! stack is full.
+//!
+//! ```rust
+//! use stackyard::Stack;
+//!
+//! let mut stack = Stack::<&str, 2>::new();
+//! assert_eq!(stack.push("bottom"), None);
+//! assert_eq!(stack.push("top"), None);
+//! assert_eq!(stack.pop(), Some("top"));
+//! ```
 use core::{
     borrow::{Borrow, BorrowMut},
     cmp::Ordering,
@@ -12,12 +26,17 @@ use core::{
 };
 
 /// A stack for holding N of T
+///
+/// Stores up to `N` values inline and removes them in last-in, first-out
+/// order. Pushing to a full stack leaves it unchanged and returns the rejected
+/// value.
 pub struct Stack<T, const N: usize> {
     buf: [MaybeUninit<T>; N],
     top: usize,
 }
 
 impl<T, const N: usize> Stack<T, N> {
+    /// Creates an empty stack with capacity `N`.
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -26,43 +45,54 @@ impl<T, const N: usize> Stack<T, N> {
         }
     }
 
+    /// Allocates an empty stack with capacity `N` in a [`Box`](alloc::boxed::Box).
     #[cfg(feature = "alloc")]
     #[inline]
     pub fn new_boxed() -> alloc::boxed::Box<Self> {
         alloc::boxed::Box::new(Self::new())
     }
 
+    /// Moves this stack into a [`Box`](alloc::boxed::Box).
     #[cfg(feature = "alloc")]
     #[inline]
     pub fn as_boxed(self) -> alloc::boxed::Box<Self> {
         alloc::boxed::Box::new(self)
     }
 
+    /// Returns the fixed number of values this stack can hold.
     #[inline]
     pub const fn capacity(&self) -> usize {
         N
     }
 
+    /// Returns the number of values currently in the stack.
     #[inline]
     pub const fn len(&self) -> usize {
         self.top
     }
 
+    /// Returns `true` if the stack contains no values.
     #[inline]
     pub const fn is_empty(&self) -> bool {
         self.top == 0
     }
 
+    /// Returns `true` if the stack can accept another value.
     #[inline]
     pub const fn has_space(&self) -> bool {
         self.top < N
     }
 
+    /// Returns `true` if the stack is at capacity.
     #[inline]
     pub const fn is_full(&self) -> bool {
         self.top == N
     }
 
+    /// Pushes `t` onto the top of the stack.
+    ///
+    /// Returns `None` when `t` is stored. If the stack is full, returns
+    /// `Some(t)` and leaves the stack unchanged.
     #[inline]
     pub const fn push(&mut self, t: T) -> Option<T> {
         if self.top == N {
@@ -74,6 +104,7 @@ impl<T, const N: usize> Stack<T, N> {
         }
     }
 
+    /// Removes and returns the top value, or `None` if the stack is empty.
     #[inline]
     pub const fn pop(&mut self) -> Option<T> {
         if self.top == 0 {
@@ -89,6 +120,7 @@ impl<T, const N: usize> Stack<T, N> {
         }
     }
 
+    /// Returns the initialized values in bottom-to-top order.
     #[inline]
     pub fn as_slice(&self) -> &[T] {
         // SAFETY:
@@ -97,6 +129,7 @@ impl<T, const N: usize> Stack<T, N> {
         unsafe { self.buf[..self.top].assume_init_ref() }
     }
 
+    /// Returns the initialized values mutably in bottom-to-top order.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: same as `as_slice`
@@ -104,6 +137,14 @@ impl<T, const N: usize> Stack<T, N> {
         unsafe { self.buf[..self.top].assume_init_mut() }
     }
 
+    /// Clones `value` onto the stack until it reaches capacity.
+    ///
+    /// Existing values remain in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`T::clone`](Clone::clone) panics. Clones pushed before the
+    /// panic remain in the stack.
     #[inline]
     pub fn fill(&mut self, value: T)
     where
@@ -116,6 +157,12 @@ impl<T, const N: usize> Stack<T, N> {
 
     // Clears the stack by dropping initialized elements and resetting the size
     // Just a straight up copy of std::Vec::clear()
+    /// Removes and drops all values in the stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a stored value's destructor panics. The stack is marked empty
+    /// before values are dropped.
     #[inline]
     pub fn clear(&mut self) {
         let elems: *mut [T] = self.as_mut_slice();
@@ -134,6 +181,10 @@ impl<T, const N: usize> Stack<T, N> {
     }
 
     // Copy as many T from src as possible, returning leftovers
+    /// Copies as many values as fit from `src` onto the stack.
+    ///
+    /// Returns the uncopied suffix when `src` exceeds the remaining capacity.
+    /// Returns `None` when `src` is empty or all of its values fit.
     pub fn copy_from_slice<'a>(&mut self, src: &'a [T]) -> Option<&'a [T]>
     where
         T: Copy,
@@ -169,6 +220,15 @@ impl<T, const N: usize> Stack<T, N> {
         }
     }
 
+    /// Clones as many values as fit from `src` onto the stack.
+    ///
+    /// Returns the uncloned suffix when `src` exceeds the remaining capacity.
+    /// Returns `None` when `src` is empty or all of its values fit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`T::clone`](Clone::clone) panics. The stack retains the
+    /// contents it held before this call.
     pub fn clone_from_slice<'a>(&mut self, src: &'a [T]) -> Option<&'a [T]>
     where
         T: Clone,
