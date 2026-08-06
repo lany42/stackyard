@@ -2,11 +2,11 @@
 name = "stackyard"
 version = "0.1.0"
 edition = "2024"
-description = "Stack based data structures and algorithms"
+description = "Freestanding data structures and algorithms"
 license = "AGPL-3.0-only"
 readme = "README.md"
 repository = "https://git.colorized.life/stackyard"
-keywords = ["no_std", "data-structures", "no-heap", "embedded"]
+keywords = ["no_std", "data-structures", "no-heap", "embedded", "algorithms"]
 categories = ["data-structures", "no-std"]
 exclude = ["/.gitignore"]
 
@@ -19,6 +19,13 @@ alloc = []
 
 [dependencies]
 
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "stack_vs_vec"
+harness = false
+
 [profile.dev.package."*"]
 opt-level = 1
 debug = false
@@ -27,5 +34,3 @@ debug = false
 lto = true
 codegen-units = 1
 strip = true
-
-

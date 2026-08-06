@@ -3,15 +3,18 @@
 //! Fixed-capacity stack storage.
 //!
 //! The [`Stack`] type keeps its elements inline, exposes its initialized
-//! contents as a slice, and returns values that cannot be pushed because the
-//! stack is full.
+//! contents as a slice, and offers both a fast [`Stack::push`] operation that
+//! silently drops values when full and [`Stack::try_push`] for recovering a
+//! rejected value.
 //!
 //! ```rust
 //! use stackyard::Stack;
 //!
 //! let mut stack = Stack::<&str, 2>::new();
-//! assert_eq!(stack.push("bottom"), None);
-//! assert_eq!(stack.push("top"), None);
+//! stack.push("bottom");
+//! stack.push("top");
+//! stack.push("silently discarded");
+//! assert_eq!(stack.try_push("returned"), Some("returned"));
 //! assert_eq!(stack.pop(), Some("top"));
 //! ```
 use core::{
@@ -25,11 +28,11 @@ use core::{
     slice::SliceIndex,
 };
 
-/// A stack for holding N of T
+/// A stack for holding up to `N` values of type `T`.
 ///
 /// Stores up to `N` values inline and removes them in last-in, first-out
-/// order. Pushing to a full stack leaves it unchanged and returns the rejected
-/// value.
+/// order. [`Stack::push`] silently drops a value when the stack is full;
+/// [`Stack::try_push`] returns the rejected value instead.
 pub struct Stack<T, const N: usize> {
     buf: [MaybeUninit<T>; N],
     top: usize,
@@ -55,7 +58,7 @@ impl<T, const N: usize> Stack<T, N> {
     /// Moves this stack into a [`Box`](alloc::boxed::Box).
     #[cfg(feature = "alloc")]
     #[inline]
-    pub fn as_boxed(self) -> alloc::boxed::Box<Self> {
+    pub fn into_boxed(self) -> alloc::boxed::Box<Self> {
         alloc::boxed::Box::new(self)
     }
 
@@ -89,18 +92,50 @@ impl<T, const N: usize> Stack<T, N> {
         self.top == N
     }
 
-    /// Pushes `t` onto the top of the stack.
+    /// Attempts to push `t` onto the top of the stack.
     ///
     /// Returns `None` when `t` is stored. If the stack is full, returns
     /// `Some(t)` and leaves the stack unchanged.
     #[inline]
-    pub const fn push(&mut self, t: T) -> Option<T> {
-        if self.top == N {
+    pub const fn try_push(&mut self, t: T) -> Option<T> {
+        if self.top >= N {
             Some(t)
         } else {
-            self.buf[self.top].write(t);
+            // SAFETY:
+            // - the branch above proves self.top is in bounds
+            // - the slot at self.top is uninitialized and exclusively borrowed
+            unsafe {
+                self.buf.as_mut_ptr().add(self.top).cast::<T>().write(t);
+            }
             self.top += 1;
             None
+        }
+    }
+
+    /// Pushes `t` onto the top of the stack if space is available.
+    ///
+    /// If the stack is full, it remains unchanged and `t` is **silently
+    /// dropped**. Use [`Stack::try_push`] when the rejected value must be
+    /// recovered.
+    ///
+    /// This unit-returning fast path avoids the fallible return overhead. In
+    /// this crate's benchmarks it maintains performance parity with
+    /// `Vec::push` after the `Vec` has allocated sufficient capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stack is full and `t`'s destructor panics while discarding
+    /// it. The stack itself remains unchanged.
+    #[inline]
+    pub fn push(&mut self, t: T) {
+        if self.top < N {
+            // SAFETY:
+            // - the branch above proves self.top is in bounds
+            // - the slot at self.top is uninitialized and exclusively borrowed
+            unsafe {
+                self.buf.as_mut_ptr().add(self.top).cast::<T>().write(t);
+            }
+            self.top += 1;
         }
     }
 
@@ -117,6 +152,23 @@ impl<T, const N: usize> Stack<T, N> {
             // - slot is outside valid prefix of buf
             // - slot is only read or dropped once
             unsafe { Some(self.buf[self.top].assume_init_read()) }
+        }
+    }
+
+    /// Returns a reference to the top value without removing it.
+    ///
+    /// Returns `None` when the stack is empty.
+    #[inline]
+    pub const fn last(&self) -> Option<&T> {
+        if self.top == 0 {
+            None
+        } else {
+            // SAFETY:
+            // - self.top is bounded by N and the branch proves self.top - 1 exists
+            // - every slot below self.top is initialized
+            // - MaybeUninit<T> has the same size and alignment as T
+            // - the returned shared reference is tied to the borrow of self
+            unsafe { Some(&*self.buf.as_ptr().add(self.top - 1).cast::<T>()) }
         }
     }
 
@@ -180,7 +232,6 @@ impl<T, const N: usize> Stack<T, N> {
         }
     }
 
-    // Copy as many T from src as possible, returning leftovers
     /// Copies as many values as fit from `src` onto the stack.
     ///
     /// Returns the uncopied suffix when `src` exceeds the remaining capacity.
@@ -495,7 +546,7 @@ mod tests {
         COPY_CLONES.store(0, Ordering::Relaxed);
         let mut stack = Stack::<CountedCopy, 3>::new();
         let input = [CountedCopy(10), CountedCopy(20), CountedCopy(30)];
-        assert_eq!(stack.push(CountedCopy(0)), None);
+        assert_eq!(stack.try_push(CountedCopy(0)), None);
 
         assert_eq!(stack.copy_from_slice(&input), Some(&input[2..]));
         assert_eq!(
@@ -516,12 +567,14 @@ mod tests {
     fn slices_cover_exactly_the_initialized_aligned_prefix() {
         let mut stack = Stack::<Aligned, 3>::new();
         assert!(stack.as_slice().is_empty());
-        assert_eq!(stack.push(Aligned(7)), None);
-        assert_eq!(stack.push(Aligned(9)), None);
+        assert_eq!(stack.try_push(Aligned(7)), None);
+        assert_eq!(stack.try_push(Aligned(9)), None);
 
         assert_eq!(stack.as_slice(), &[Aligned(7), Aligned(9)]);
+        assert_eq!(stack.last(), Some(&Aligned(9)));
         stack.as_mut_slice().swap(0, 1);
         assert_eq!(stack.as_slice(), &[Aligned(9), Aligned(7)]);
+        assert_eq!(stack.last(), Some(&Aligned(7)));
     }
 
     struct Tracked {
@@ -545,15 +598,15 @@ mod tests {
     }
 
     #[test]
-    fn push_pop_and_drop_transfer_each_value_exactly_once() {
+    fn try_push_pop_and_drop_transfer_each_value_exactly_once() {
         let drops = Rc::new(Cell::new(0));
         let mut stack = Stack::<Tracked, 3>::new();
         for value in [10, 20, 30] {
-            assert!(stack.push(Tracked::new(value, &drops)).is_none());
+            assert!(stack.try_push(Tracked::new(value, &drops)).is_none());
         }
 
         let rejected = stack
-            .push(Tracked::new(40, &drops))
+            .try_push(Tracked::new(40, &drops))
             .expect("a full stack returns the rejected value");
         assert_eq!(rejected.value, 40);
         drop(rejected);
@@ -569,9 +622,46 @@ mod tests {
     }
 
     #[test]
+    fn push_silently_drops_a_value_rejected_by_a_full_stack() {
+        let drops = Rc::new(Cell::new(0));
+        let mut stack = Stack::<Tracked, 1>::new();
+
+        stack.push(Tracked::new(10, &drops));
+        assert_eq!(stack.len(), 1);
+        assert_eq!(drops.get(), 0);
+
+        stack.push(Tracked::new(20, &drops));
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.as_slice()[0].value, 10);
+        assert_eq!(drops.get(), 1);
+
+        drop(stack);
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn last_borrows_the_top_value_without_removing_it() {
+        let mut stack = Stack::<u8, 2>::new();
+        assert_eq!(stack.last(), None);
+
+        stack.push(10);
+        assert_eq!(stack.last(), Some(&10));
+        assert_eq!(stack.len(), 1);
+
+        stack.push(20);
+        assert_eq!(stack.last(), Some(&20));
+        assert_eq!(stack.len(), 2);
+
+        assert_eq!(stack.pop(), Some(20));
+        assert_eq!(stack.last(), Some(&10));
+        assert_eq!(stack.pop(), Some(10));
+        assert_eq!(stack.last(), None);
+    }
+
+    #[test]
     fn clone_from_slice_returns_remainder_and_stack_clone_is_independent() {
         let mut stack = Stack::<String, 3>::new();
-        assert!(stack.push(String::from("existing")).is_none());
+        assert!(stack.try_push(String::from("existing")).is_none());
         let input = [
             String::from("left"),
             String::from("right"),
@@ -616,7 +706,7 @@ mod tests {
         let mut stack = Stack::<PanickingClone, 3>::new();
         assert!(
             stack
-                .push(PanickingClone {
+                .try_push(PanickingClone {
                     panic_on_clone: false,
                     drops: Rc::clone(&drops),
                 })
@@ -648,8 +738,8 @@ mod tests {
 
     const CONST_METHOD_RESULTS: (usize, Option<u8>, Option<u8>, bool, Option<u8>, bool, bool) = {
         let mut stack = Stack::<u8, 1>::new();
-        let first_push = stack.push(7);
-        let rejected_push = stack.push(9);
+        let first_push = stack.try_push(7);
+        let rejected_push = stack.try_push(9);
         let was_full = stack.is_full();
         let popped = stack.pop();
         let is_empty = stack.is_empty();
@@ -667,12 +757,28 @@ mod tests {
         results
     };
 
+    const CONST_LAST_RESULTS: (Option<u8>, Option<u8>) = {
+        let mut stack = Stack::<u8, 1>::new();
+        let empty = match stack.last() {
+            Some(value) => Some(*value),
+            None => None,
+        };
+        let _ = stack.try_push(7);
+        let populated = match stack.last() {
+            Some(value) => Some(*value),
+            None => None,
+        };
+        core::mem::forget(stack);
+        (empty, populated)
+    };
+
     #[test]
     fn const_methods_can_manipulate_stack_state() {
         assert_eq!(
             CONST_METHOD_RESULTS,
             (1, None, Some(9), true, Some(7), true, true)
         );
+        assert_eq!(CONST_LAST_RESULTS, (None, Some(7)));
     }
 
     // Explicit RHS references exercise the corresponding `PartialEq<&...>` impls.
@@ -690,7 +796,7 @@ mod tests {
 
         let mut stack = Stack::<Stored, 4>::new();
         for value in [1, 2, 3] {
-            assert!(stack.push(Stored(value)).is_none());
+            assert!(stack.try_push(Stored(value)).is_none());
         }
 
         let array = [Compared(1), Compared(2), Compared(3)];
@@ -722,14 +828,14 @@ mod tests {
         );
         assert!(stack.as_slice().is_empty());
         assert!(stack.as_mut_slice().is_empty());
-        assert_eq!(stack.push(30), Some(30));
+        assert_eq!(stack.try_push(30), Some(30));
         assert_eq!(stack.pop(), None);
     }
 
     #[test]
     fn fill_clones_until_capacity_and_leaves_existing_values_in_place() {
         let mut stack = Stack::<String, 3>::new();
-        assert!(stack.push(String::from("existing")).is_none());
+        assert!(stack.try_push(String::from("existing")).is_none());
 
         stack.fill(String::from("fill"));
 
@@ -799,7 +905,7 @@ mod tests {
         for panic_on_drop in [true, false, false] {
             assert!(
                 stack
-                    .push(PanickingDrop {
+                    .try_push(PanickingDrop {
                         panic_on_drop,
                         drops: Rc::clone(&drops),
                     })
@@ -817,7 +923,7 @@ mod tests {
         for _ in 0..3 {
             assert!(
                 stack
-                    .push(PanickingDrop {
+                    .try_push(PanickingDrop {
                         panic_on_drop: false,
                         drops: Rc::clone(&drops),
                     })
@@ -845,7 +951,7 @@ mod tests {
         ZST_DROPS.store(0, Ordering::Relaxed);
         let mut stack = Stack::<DroppedZst, 3>::new();
         for _ in 0..3 {
-            assert!(stack.push(DroppedZst).is_none());
+            assert!(stack.try_push(DroppedZst).is_none());
         }
 
         drop(stack.pop().expect("the stack contains three values"));
