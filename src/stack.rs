@@ -62,6 +62,32 @@ impl<T, const N: usize> Stack<T, N> {
         alloc::boxed::Box::new(self)
     }
 
+    /// Moves the stack's values into a freshly allocated
+    /// [`Vec`](alloc::vec::Vec).
+    ///
+    /// The vector is allocated with capacity for all `N` possible values and
+    /// preserves their bottom-to-top order.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn into_vec(mut self) -> alloc::vec::Vec<T> {
+        let len = self.top;
+        let mut vec = alloc::vec::Vec::with_capacity(N);
+
+        // SAFETY:
+        // - `len` is bounded by `N`, and every source slot below it is initialized
+        // - `vec` has capacity for at least `N` values, so its destination is valid
+        // - the inline source and separately allocated destination do not overlap
+        // - the copy initializes the first `len` vector slots before `set_len`
+        unsafe {
+            ptr::copy_nonoverlapping(self.buf.as_ptr().cast::<T>(), vec.as_mut_ptr(), len);
+            vec.set_len(len);
+        }
+
+        // Ownership of the initialized values now belongs to `vec`.
+        self.top = 0;
+        vec
+    }
+
     /// Returns the fixed number of values this stack can hold.
     #[inline]
     pub const fn capacity(&self) -> usize {
@@ -619,6 +645,39 @@ mod tests {
 
         drop(stack);
         assert_eq!(drops.get(), 4);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn into_vec_moves_values_in_order_and_preserves_capacity() {
+        let drops = Rc::new(Cell::new(0));
+        let mut stack = Stack::<Tracked, 4>::new();
+        for value in [10, 20, 30] {
+            assert!(stack.try_push(Tracked::new(value, &drops)).is_none());
+        }
+
+        let vec = stack.into_vec();
+
+        assert_eq!(
+            vec.iter()
+                .map(|tracked| tracked.value)
+                .collect::<std::vec::Vec<_>>(),
+            [10, 20, 30]
+        );
+        assert!(vec.capacity() >= 4);
+        assert_eq!(drops.get(), 0);
+
+        drop(vec);
+        assert_eq!(drops.get(), 3);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn into_vec_handles_zero_capacity() {
+        let vec = Stack::<u8, 0>::new().into_vec();
+
+        assert!(vec.is_empty());
+        assert_eq!(vec.capacity(), 0);
     }
 
     #[test]
