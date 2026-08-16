@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 
-//! Raw operation throughput for `Stack` against a preallocated `Vec`.
+//! Raw operation throughput for `InlineStack` against a preallocated `Vec`.
 //!
 //! Destination construction, `Vec` allocation, and pop-source population all
 //! happen in `iter_batched_ref` setup, outside the measured routine. Each timed
@@ -14,7 +14,7 @@
 use std::{array, hint::black_box, rc::Rc};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use stackyard::Stack;
+use stackyard::InlineStack;
 
 const ELEMENTS: usize = 256;
 
@@ -27,9 +27,9 @@ fn push(c: &mut Criterion) {
     let mut group = c.benchmark_group("push_after_allocation");
     group.throughput(Throughput::Elements(ELEMENTS as u64));
 
-    group.bench_function("Stack::try_push", |b| {
+    group.bench_function("InlineStack::try_push", |b| {
         b.iter_batched_ref(
-            Stack::<u64, ELEMENTS>::new,
+            InlineStack::<u64, ELEMENTS>::new,
             |stack| {
                 let stack = black_box(stack);
                 for &value in black_box(values.as_slice()) {
@@ -42,9 +42,9 @@ fn push(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("Stack::push", |b| {
+    group.bench_function("InlineStack::push", |b| {
         b.iter_batched_ref(
-            Stack::<u64, ELEMENTS>::new,
+            InlineStack::<u64, ELEMENTS>::new,
             |stack| {
                 let stack = black_box(stack);
                 for &value in black_box(values.as_slice()) {
@@ -78,10 +78,10 @@ fn pop(c: &mut Criterion) {
     let mut group = c.benchmark_group("pop");
     group.throughput(Throughput::Elements(ELEMENTS as u64));
 
-    group.bench_function("Stack::pop", |b| {
+    group.bench_function("InlineStack::pop", |b| {
         b.iter_batched_ref(
             || {
-                let mut stack = Stack::<u64, ELEMENTS>::new();
+                let mut stack = InlineStack::<u64, ELEMENTS>::new();
                 assert!(stack.copy_from_slice(&values).is_none());
                 stack
             },
@@ -124,9 +124,9 @@ fn copy_from_slice(c: &mut Criterion) {
     let mut group = c.benchmark_group("copy_from_slice");
     group.throughput(Throughput::Elements(ELEMENTS as u64));
 
-    group.bench_function("Stack::copy_from_slice", |b| {
+    group.bench_function("InlineStack::copy_from_slice", |b| {
         b.iter_batched_ref(
-            Stack::<u64, ELEMENTS>::new,
+            InlineStack::<u64, ELEMENTS>::new,
             |stack| {
                 let stack = black_box(stack);
                 let remainder = stack.copy_from_slice(black_box(values.as_slice()));
@@ -171,9 +171,9 @@ fn clone_from_slice(c: &mut Criterion) {
     let mut group = c.benchmark_group("clone_from_slice");
     group.throughput(Throughput::Elements(ELEMENTS as u64));
 
-    group.bench_function("Stack::clone_from_slice", |b| {
+    group.bench_function("InlineStack::clone_from_slice", |b| {
         b.iter_batched_ref(
-            Stack::<Rc<u64>, ELEMENTS>::new,
+            InlineStack::<Rc<u64>, ELEMENTS>::new,
             |stack| {
                 let stack = black_box(stack);
                 let remainder = stack.clone_from_slice(black_box(values.as_slice()));

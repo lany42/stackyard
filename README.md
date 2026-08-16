@@ -19,9 +19,9 @@ stackyard = { version = "0", default-features = false }
 ## Quick Start
 
 ```rust
-use stackyard::Stack;
+use stackyard::InlineStack;
 
-let mut stack = Stack::<u8, 2>::new();
+let mut stack = InlineStack::<u8, 2>::new();
 stack.push(10);
 stack.push(20);
 stack.push(30); // Full: 30 is silently dropped.
@@ -31,10 +31,10 @@ assert_eq!(stack.try_push(30), Some(30));
 assert_eq!(stack.pop(), Some(20));
 ```
 
-`Stack::push` deliberately returns `()` and silently drops its input when the
-stack is full. This keeps it at performance parity with `Vec::push` after the
-`Vec` has allocated sufficient capacity. Use `Stack::try_push` when the rejected
-value must be recovered.
+`InlineStack::push` deliberately returns `()` and silently drops its input when
+the stack is full. This keeps it at performance parity with `Vec::push` after
+the `Vec` has allocated sufficient capacity. Use `InlineStack::try_push` when
+the rejected value must be recovered.
 
 ## Feature Flags
 

@@ -2,15 +2,15 @@
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 //! Fixed-capacity stack storage.
 //!
-//! The [`Stack`] type keeps its elements inline, exposes its initialized
-//! contents as a slice, and offers both a fast [`Stack::push`] operation that
-//! silently drops values when full and [`Stack::try_push`] for recovering a
-//! rejected value.
+//! The [`InlineStack`] type keeps its elements inline, exposes its initialized
+//! contents as a slice, and offers both a fast [`InlineStack::push`] operation
+//! that silently drops values when full and [`InlineStack::try_push`] for
+//! recovering a rejected value.
 //!
 //! ```rust
-//! use stackyard::Stack;
+//! use stackyard::InlineStack;
 //!
-//! let mut stack = Stack::<&str, 2>::new();
+//! let mut stack = InlineStack::<&str, 2>::new();
 //! stack.push("bottom");
 //! stack.push("top");
 //! stack.push("silently discarded");
@@ -31,14 +31,18 @@ use core::{
 /// A stack for holding up to `N` values of type `T`.
 ///
 /// Stores up to `N` values inline and removes them in last-in, first-out
-/// order. [`Stack::push`] silently drops a value when the stack is full;
-/// [`Stack::try_push`] returns the rejected value instead.
-pub struct Stack<T, const N: usize> {
+/// order. [`InlineStack::push`] silently drops a value when the stack is full;
+/// [`InlineStack::try_push`] returns the rejected value instead.
+///
+/// The backing array is part of the stack value itself. Moving or cloning an
+/// `InlineStack` is safe, but may be expensive when that backing array is
+/// large.
+pub struct InlineStack<T, const N: usize> {
     buf: [MaybeUninit<T>; N],
     top: usize,
 }
 
-impl<T, const N: usize> Stack<T, N> {
+impl<T, const N: usize> InlineStack<T, N> {
     /// Creates an empty stack with capacity `N`.
     #[inline]
     pub const fn new() -> Self {
@@ -141,7 +145,7 @@ impl<T, const N: usize> Stack<T, N> {
     /// Pushes `t` onto the top of the stack if space is available.
     ///
     /// If the stack is full, it remains unchanged and `t` is **silently
-    /// dropped**. Use [`Stack::try_push`] when the rejected value must be
+    /// dropped**. Use [`InlineStack::try_push`] when the rejected value must be
     /// recovered.
     ///
     /// This unit-returning fast path avoids the fallible return overhead. In
@@ -343,13 +347,13 @@ impl<T, const N: usize> Stack<T, N> {
     }
 }
 
-impl<T, const N: usize> Default for Stack<T, N> {
+impl<T, const N: usize> Default for InlineStack<T, N> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Clone, const N: usize> Clone for Stack<T, N> {
+impl<T: Clone, const N: usize> Clone for InlineStack<T, N> {
     fn clone(&self) -> Self {
         let mut new = Self::new();
         new.clone_from_slice(self.as_slice());
@@ -357,45 +361,47 @@ impl<T: Clone, const N: usize> Clone for Stack<T, N> {
     }
 }
 
-impl<T, const N: usize> Drop for Stack<T, N> {
+impl<T, const N: usize> Drop for InlineStack<T, N> {
     #[inline]
     fn drop(&mut self) {
         self.clear();
     }
 }
 
-impl<T: Hash, const N: usize> Hash for Stack<T, N> {
+impl<T: Hash, const N: usize> Hash for InlineStack<T, N> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_slice().hash(state);
     }
 }
 
-impl<T: PartialOrd, const N: usize, const M: usize> PartialOrd<Stack<T, M>> for Stack<T, N> {
+impl<T: PartialOrd, const N: usize, const M: usize> PartialOrd<InlineStack<T, M>>
+    for InlineStack<T, N>
+{
     #[inline]
-    fn partial_cmp(&self, other: &Stack<T, M>) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &InlineStack<T, M>) -> Option<Ordering> {
         self.as_slice().partial_cmp(other.as_slice())
     }
 }
 
-impl<T: Ord, const N: usize> Ord for Stack<T, N> {
+impl<T: Ord, const N: usize> Ord for InlineStack<T, N> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_slice().cmp(other.as_slice())
     }
 }
 
-impl<T, U, const N: usize, const M: usize> PartialEq<Stack<U, M>> for Stack<T, N>
+impl<T, U, const N: usize, const M: usize> PartialEq<InlineStack<U, M>> for InlineStack<T, N>
 where
     T: PartialEq<U>,
 {
     #[inline]
-    fn eq(&self, other: &Stack<U, M>) -> bool {
+    fn eq(&self, other: &InlineStack<U, M>) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<T, U, const N: usize> PartialEq<[U]> for Stack<T, N>
+impl<T, U, const N: usize> PartialEq<[U]> for InlineStack<T, N>
 where
     T: PartialEq<U>,
 {
@@ -405,7 +411,7 @@ where
     }
 }
 
-impl<T, U, const N: usize> PartialEq<&[U]> for Stack<T, N>
+impl<T, U, const N: usize> PartialEq<&[U]> for InlineStack<T, N>
 where
     T: PartialEq<U>,
 {
@@ -415,7 +421,7 @@ where
     }
 }
 
-impl<T, U, const N: usize, const M: usize> PartialEq<[U; M]> for Stack<T, N>
+impl<T, U, const N: usize, const M: usize> PartialEq<[U; M]> for InlineStack<T, N>
 where
     T: PartialEq<U>,
 {
@@ -425,7 +431,7 @@ where
     }
 }
 
-impl<T, U, const N: usize, const M: usize> PartialEq<&[U; M]> for Stack<T, N>
+impl<T, U, const N: usize, const M: usize> PartialEq<&[U; M]> for InlineStack<T, N>
 where
     T: PartialEq<U>,
 {
@@ -435,9 +441,9 @@ where
     }
 }
 
-impl<T: Eq, const N: usize> Eq for Stack<T, N> {}
+impl<T: Eq, const N: usize> Eq for InlineStack<T, N> {}
 
-impl<T, I, const N: usize> Index<I> for Stack<T, N>
+impl<T, I, const N: usize> Index<I> for InlineStack<T, N>
 where
     I: SliceIndex<[T]>,
 {
@@ -449,7 +455,7 @@ where
     }
 }
 
-impl<T, I, const N: usize> IndexMut<I> for Stack<T, N>
+impl<T, I, const N: usize> IndexMut<I> for InlineStack<T, N>
 where
     I: SliceIndex<[T]>,
 {
@@ -459,49 +465,49 @@ where
     }
 }
 
-impl<T, const N: usize> AsRef<[T]> for Stack<T, N> {
+impl<T, const N: usize> AsRef<[T]> for InlineStack<T, N> {
     #[inline]
     fn as_ref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<T, const N: usize> AsMut<[T]> for Stack<T, N> {
+impl<T, const N: usize> AsMut<[T]> for InlineStack<T, N> {
     #[inline]
     fn as_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<T, const N: usize> AsRef<Stack<T, N>> for Stack<T, N> {
+impl<T, const N: usize> AsRef<InlineStack<T, N>> for InlineStack<T, N> {
     #[inline]
-    fn as_ref(&self) -> &Stack<T, N> {
+    fn as_ref(&self) -> &InlineStack<T, N> {
         self
     }
 }
 
-impl<T, const N: usize> AsMut<Stack<T, N>> for Stack<T, N> {
+impl<T, const N: usize> AsMut<InlineStack<T, N>> for InlineStack<T, N> {
     #[inline]
-    fn as_mut(&mut self) -> &mut Stack<T, N> {
+    fn as_mut(&mut self) -> &mut InlineStack<T, N> {
         self
     }
 }
 
-impl<T, const N: usize> Borrow<[T]> for Stack<T, N> {
+impl<T, const N: usize> Borrow<[T]> for InlineStack<T, N> {
     #[inline]
     fn borrow(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<T, const N: usize> BorrowMut<[T]> for Stack<T, N> {
+impl<T, const N: usize> BorrowMut<[T]> for InlineStack<T, N> {
     #[inline]
     fn borrow_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<T, const N: usize> Deref for Stack<T, N> {
+impl<T, const N: usize> Deref for InlineStack<T, N> {
     type Target = [T];
 
     #[inline]
@@ -510,14 +516,14 @@ impl<T, const N: usize> Deref for Stack<T, N> {
     }
 }
 
-impl<T, const N: usize> DerefMut for Stack<T, N> {
+impl<T, const N: usize> DerefMut for InlineStack<T, N> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a Stack<T, N> {
+impl<'a, T, const N: usize> IntoIterator for &'a InlineStack<T, N> {
     type Item = &'a T;
     type IntoIter = core::slice::Iter<'a, T>;
 
@@ -527,7 +533,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a Stack<T, N> {
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a mut Stack<T, N> {
+impl<'a, T, const N: usize> IntoIterator for &'a mut InlineStack<T, N> {
     type Item = &'a mut T;
     type IntoIter = core::slice::IterMut<'a, T>;
 
@@ -541,7 +547,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a mut Stack<T, N> {
 mod tests {
     extern crate std;
 
-    use super::Stack;
+    use super::InlineStack;
     use std::{
         cell::Cell,
         panic::{AssertUnwindSafe, catch_unwind},
@@ -570,7 +576,7 @@ mod tests {
     #[test]
     fn copy_from_slice_initializes_the_available_suffix_without_cloning() {
         COPY_CLONES.store(0, Ordering::Relaxed);
-        let mut stack = Stack::<CountedCopy, 3>::new();
+        let mut stack = InlineStack::<CountedCopy, 3>::new();
         let input = [CountedCopy(10), CountedCopy(20), CountedCopy(30)];
         assert_eq!(stack.try_push(CountedCopy(0)), None);
 
@@ -591,7 +597,7 @@ mod tests {
 
     #[test]
     fn slices_cover_exactly_the_initialized_aligned_prefix() {
-        let mut stack = Stack::<Aligned, 3>::new();
+        let mut stack = InlineStack::<Aligned, 3>::new();
         assert!(stack.as_slice().is_empty());
         assert_eq!(stack.try_push(Aligned(7)), None);
         assert_eq!(stack.try_push(Aligned(9)), None);
@@ -626,7 +632,7 @@ mod tests {
     #[test]
     fn try_push_pop_and_drop_transfer_each_value_exactly_once() {
         let drops = Rc::new(Cell::new(0));
-        let mut stack = Stack::<Tracked, 3>::new();
+        let mut stack = InlineStack::<Tracked, 3>::new();
         for value in [10, 20, 30] {
             assert!(stack.try_push(Tracked::new(value, &drops)).is_none());
         }
@@ -651,7 +657,7 @@ mod tests {
     #[test]
     fn into_vec_moves_values_in_order_and_preserves_capacity() {
         let drops = Rc::new(Cell::new(0));
-        let mut stack = Stack::<Tracked, 4>::new();
+        let mut stack = InlineStack::<Tracked, 4>::new();
         for value in [10, 20, 30] {
             assert!(stack.try_push(Tracked::new(value, &drops)).is_none());
         }
@@ -674,7 +680,7 @@ mod tests {
     #[cfg(feature = "alloc")]
     #[test]
     fn into_vec_handles_zero_capacity() {
-        let vec = Stack::<u8, 0>::new().into_vec();
+        let vec = InlineStack::<u8, 0>::new().into_vec();
 
         assert!(vec.is_empty());
         assert_eq!(vec.capacity(), 0);
@@ -683,7 +689,7 @@ mod tests {
     #[test]
     fn push_silently_drops_a_value_rejected_by_a_full_stack() {
         let drops = Rc::new(Cell::new(0));
-        let mut stack = Stack::<Tracked, 1>::new();
+        let mut stack = InlineStack::<Tracked, 1>::new();
 
         stack.push(Tracked::new(10, &drops));
         assert_eq!(stack.len(), 1);
@@ -700,7 +706,7 @@ mod tests {
 
     #[test]
     fn last_borrows_the_top_value_without_removing_it() {
-        let mut stack = Stack::<u8, 2>::new();
+        let mut stack = InlineStack::<u8, 2>::new();
         assert_eq!(stack.last(), None);
 
         stack.push(10);
@@ -719,7 +725,7 @@ mod tests {
 
     #[test]
     fn clone_from_slice_returns_remainder_and_stack_clone_is_independent() {
-        let mut stack = Stack::<String, 3>::new();
+        let mut stack = InlineStack::<String, 3>::new();
         assert!(stack.try_push(String::from("existing")).is_none());
         let input = [
             String::from("left"),
@@ -762,7 +768,7 @@ mod tests {
     #[test]
     fn clone_from_slice_rolls_back_only_the_new_suffix_on_panic() {
         let drops = Rc::new(Cell::new(0));
-        let mut stack = Stack::<PanickingClone, 3>::new();
+        let mut stack = InlineStack::<PanickingClone, 3>::new();
         assert!(
             stack
                 .try_push(PanickingClone {
@@ -796,7 +802,7 @@ mod tests {
     }
 
     const CONST_METHOD_RESULTS: (usize, Option<u8>, Option<u8>, bool, Option<u8>, bool, bool) = {
-        let mut stack = Stack::<u8, 1>::new();
+        let mut stack = InlineStack::<u8, 1>::new();
         let first_push = stack.try_push(7);
         let rejected_push = stack.try_push(9);
         let was_full = stack.is_full();
@@ -817,7 +823,7 @@ mod tests {
     };
 
     const CONST_LAST_RESULTS: (Option<u8>, Option<u8>) = {
-        let mut stack = Stack::<u8, 1>::new();
+        let mut stack = InlineStack::<u8, 1>::new();
         let empty = match stack.last() {
             Some(value) => Some(*value),
             None => None,
@@ -853,7 +859,7 @@ mod tests {
             }
         }
 
-        let mut stack = Stack::<Stored, 4>::new();
+        let mut stack = InlineStack::<Stored, 4>::new();
         for value in [1, 2, 3] {
             assert!(stack.try_push(Stored(value)).is_none());
         }
@@ -873,7 +879,7 @@ mod tests {
 
     #[test]
     fn zero_capacity_never_exposes_or_accepts_values() {
-        let mut stack = Stack::<u8, 0>::new();
+        let mut stack = InlineStack::<u8, 0>::new();
 
         assert_eq!(
             (
@@ -893,7 +899,7 @@ mod tests {
 
     #[test]
     fn fill_clones_until_capacity_and_leaves_existing_values_in_place() {
-        let mut stack = Stack::<String, 3>::new();
+        let mut stack = InlineStack::<String, 3>::new();
         assert!(stack.try_push(String::from("existing")).is_none());
 
         stack.fill(String::from("fill"));
@@ -928,7 +934,7 @@ mod tests {
     fn fill_leaves_successful_clones_initialized_when_a_later_clone_panics() {
         let clone_calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
-        let mut stack = Stack::<PanicAfterOneClone, 3>::new();
+        let mut stack = InlineStack::<PanicAfterOneClone, 3>::new();
         let value = PanicAfterOneClone {
             clone_calls: Rc::clone(&clone_calls),
             drops: Rc::clone(&drops),
@@ -960,7 +966,7 @@ mod tests {
     #[test]
     fn clear_invalidates_the_prefix_before_a_destructor_panics() {
         let drops = Rc::new(Cell::new(0));
-        let mut stack = Stack::<PanickingDrop, 3>::new();
+        let mut stack = InlineStack::<PanickingDrop, 3>::new();
         for panic_on_drop in [true, false, false] {
             assert!(
                 stack
@@ -1008,7 +1014,7 @@ mod tests {
     fn zero_sized_values_are_popped_and_cleared_exactly_once() {
         assert_eq!(core::mem::size_of::<DroppedZst>(), 0);
         ZST_DROPS.store(0, Ordering::Relaxed);
-        let mut stack = Stack::<DroppedZst, 3>::new();
+        let mut stack = InlineStack::<DroppedZst, 3>::new();
         for _ in 0..3 {
             assert!(stack.try_push(DroppedZst).is_none());
         }
