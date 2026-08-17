@@ -51,8 +51,10 @@
 #![no_std]
 
 #[cfg(feature = "alloc")]
-extern crate alloc;
+extern crate alloc as rust_alloc;
 
+pub mod alloc;
 mod stack;
 
+pub use alloc::{Alloc, TypedBlock, UntypedBlock};
 pub use stack::{InlineStack, Stack};

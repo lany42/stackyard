@@ -52,30 +52,31 @@ impl<T, const N: usize> InlineStack<T, N> {
         }
     }
 
-    /// Allocates an empty stack with capacity `N` in a [`Box`](alloc::boxed::Box).
+    /// Allocates an empty stack with capacity `N` in a
+    /// [`Box`](crate::rust_alloc::boxed::Box).
     #[cfg(feature = "alloc")]
     #[inline]
-    pub fn new_boxed() -> alloc::boxed::Box<Self> {
-        alloc::boxed::Box::new(Self::new())
+    pub fn new_boxed() -> crate::rust_alloc::boxed::Box<Self> {
+        crate::rust_alloc::boxed::Box::new(Self::new())
     }
 
-    /// Moves this stack into a [`Box`](alloc::boxed::Box).
+    /// Moves this stack into a [`Box`](crate::rust_alloc::boxed::Box).
     #[cfg(feature = "alloc")]
     #[inline]
-    pub fn into_boxed(self) -> alloc::boxed::Box<Self> {
-        alloc::boxed::Box::new(self)
+    pub fn into_boxed(self) -> crate::rust_alloc::boxed::Box<Self> {
+        crate::rust_alloc::boxed::Box::new(self)
     }
 
     /// Moves the stack's values into a freshly allocated
-    /// [`Vec`](alloc::vec::Vec).
+    /// [`Vec`](crate::rust_alloc::vec::Vec).
     ///
     /// The vector is allocated with capacity for all `N` possible values and
     /// preserves their bottom-to-top order.
     #[cfg(feature = "alloc")]
     #[inline]
-    pub fn into_vec(mut self) -> alloc::vec::Vec<T> {
+    pub fn into_vec(mut self) -> crate::rust_alloc::vec::Vec<T> {
         let len = self.top;
-        let mut vec = alloc::vec::Vec::with_capacity(N);
+        let mut vec = crate::rust_alloc::vec::Vec::with_capacity(N);
 
         // SAFETY:
         // - `len` is bounded by `N`, and every source slot below it is initialized
@@ -128,16 +129,19 @@ impl<T, const N: usize> InlineStack<T, N> {
     /// `Some(t)` and leaves the stack unchanged.
     #[inline]
     pub const fn try_push(&mut self, t: T) -> Option<T> {
-        if self.top >= N {
+        let top = self.top;
+
+        if top >= N {
             Some(t)
         } else {
             // SAFETY:
-            // - the branch above proves self.top is in bounds
-            // - the slot at self.top is uninitialized and exclusively borrowed
+            // - the branch above proves `top` is in bounds
+            // - the slot at `top` is uninitialized and exclusively borrowed
             unsafe {
-                self.buf.as_mut_ptr().add(self.top).cast::<T>().write(t);
+                let end = self.buf.as_mut_ptr().add(top).cast::<T>();
+                ptr::write(end, t);
+                self.top = top + 1;
             }
-            self.top += 1;
             None
         }
     }
@@ -158,14 +162,17 @@ impl<T, const N: usize> InlineStack<T, N> {
     /// it. The stack itself remains unchanged.
     #[inline]
     pub fn push(&mut self, t: T) {
-        if self.top < N {
+        let top = self.top;
+
+        if top < N {
             // SAFETY:
-            // - the branch above proves self.top is in bounds
-            // - the slot at self.top is uninitialized and exclusively borrowed
+            // - the branch above proves `top` is in bounds
+            // - the slot at `top` is uninitialized and exclusively borrowed
             unsafe {
-                self.buf.as_mut_ptr().add(self.top).cast::<T>().write(t);
+                let end = self.buf.as_mut_ptr().add(top).cast::<T>();
+                ptr::write(end, t);
+                self.top = top + 1;
             }
-            self.top += 1;
         }
     }
 
@@ -633,9 +640,23 @@ mod tests {
     fn try_push_pop_and_drop_transfer_each_value_exactly_once() {
         let drops = Rc::new(Cell::new(0));
         let mut stack = InlineStack::<Tracked, 3>::new();
-        for value in [10, 20, 30] {
-            assert!(stack.try_push(Tracked::new(value, &drops)).is_none());
-        }
+
+        assert!(stack.is_empty());
+        assert!(stack.last().is_none());
+
+        assert!(stack.try_push(Tracked::new(10, &drops)).is_none());
+        stack.push(Tracked::new(20, &drops));
+        assert!(stack.try_push(Tracked::new(30, &drops)).is_none());
+        assert_eq!(
+            stack
+                .as_slice()
+                .iter()
+                .map(|tracked| tracked.value)
+                .collect::<std::vec::Vec<_>>(),
+            [10, 20, 30]
+        );
+        assert_eq!(stack.last().map(|tracked| tracked.value), Some(30));
+        assert!(stack.is_full());
 
         let rejected = stack
             .try_push(Tracked::new(40, &drops))
@@ -644,13 +665,27 @@ mod tests {
         drop(rejected);
         assert_eq!(drops.get(), 1);
 
+        stack.push(Tracked::new(50, &drops));
+        assert_eq!(drops.get(), 2);
+        assert_eq!(
+            stack
+                .as_slice()
+                .iter()
+                .map(|tracked| tracked.value)
+                .collect::<std::vec::Vec<_>>(),
+            [10, 20, 30]
+        );
+
         let popped = stack.pop().expect("the stack is not empty");
         assert_eq!(popped.value, 30);
         drop(popped);
-        assert_eq!(drops.get(), 2);
+        assert_eq!(drops.get(), 3);
+        assert_eq!(stack.last().map(|tracked| tracked.value), Some(20));
+        assert_eq!(stack.len(), 2);
+        assert!(stack.has_space());
 
         drop(stack);
-        assert_eq!(drops.get(), 4);
+        assert_eq!(drops.get(), 5);
     }
 
     #[cfg(feature = "alloc")]
@@ -684,43 +719,6 @@ mod tests {
 
         assert!(vec.is_empty());
         assert_eq!(vec.capacity(), 0);
-    }
-
-    #[test]
-    fn push_silently_drops_a_value_rejected_by_a_full_stack() {
-        let drops = Rc::new(Cell::new(0));
-        let mut stack = InlineStack::<Tracked, 1>::new();
-
-        stack.push(Tracked::new(10, &drops));
-        assert_eq!(stack.len(), 1);
-        assert_eq!(drops.get(), 0);
-
-        stack.push(Tracked::new(20, &drops));
-        assert_eq!(stack.len(), 1);
-        assert_eq!(stack.as_slice()[0].value, 10);
-        assert_eq!(drops.get(), 1);
-
-        drop(stack);
-        assert_eq!(drops.get(), 2);
-    }
-
-    #[test]
-    fn last_borrows_the_top_value_without_removing_it() {
-        let mut stack = InlineStack::<u8, 2>::new();
-        assert_eq!(stack.last(), None);
-
-        stack.push(10);
-        assert_eq!(stack.last(), Some(&10));
-        assert_eq!(stack.len(), 1);
-
-        stack.push(20);
-        assert_eq!(stack.last(), Some(&20));
-        assert_eq!(stack.len(), 2);
-
-        assert_eq!(stack.pop(), Some(20));
-        assert_eq!(stack.last(), Some(&10));
-        assert_eq!(stack.pop(), Some(10));
-        assert_eq!(stack.last(), None);
     }
 
     #[test]
