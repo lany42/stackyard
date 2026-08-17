@@ -1,14 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
-//! Raw-storage allocation for stackyard collections.
+//! Fixed-capacity raw storage for allocator-backed collections.
 //!
-//! [`Alloc`] is public for use in collection bounds, but sealed so allocator
-//! implementations remain inside this crate. Implementations grant exclusive
-//! leases over raw storage; collections remain responsible for initialization,
-//! typed validity, and destruction of values stored there.
+//! The sealed [`Alloc`] trait grants exclusive leases over raw storage.
+//! [`TypedBlock`] provides an aligned block sized for `N` values of one type;
+//! [`UntypedBlock`] provides `N` bytes and aligns each request within them. Both
+//! implementations are reusable, but grant only one positive-sized lease at a
+//! time.
 //!
 //! Zero-sized layouts are unsupported and are rejected without producing a
-//! pointer or changing allocator state.
+//! pointer or changing allocator state. Allocators do not initialize or drop
+//! values; the collection using a lease owns those responsibilities.
+//!
+//! ```rust
+//! use stackyard::{Stack, alloc::TypedBlock};
+//!
+//! let block = TypedBlock::<u8, 2>::new();
+//! let mut stack = Stack::<u8, _>::try_new_in(2, &block).unwrap();
+//! stack.push(1);
+//! assert_eq!(stack.pop(), Some(1));
+//! ```
 
 use core::{alloc::Layout, ptr::NonNull};
 
@@ -23,7 +34,7 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// A crate-provided allocator of exclusive raw-storage leases.
+/// A sealed allocator of exclusive raw-storage leases.
 ///
 /// A successful positive-sized allocation grants its caller exclusive access
 /// authority over the requested byte range. Pointer values may be copied, but

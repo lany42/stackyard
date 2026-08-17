@@ -1,6 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
-//! Stack data structures.
+//! Fixed-capacity last-in, first-out collections.
+//!
+//! [`InlineStack`] owns an inline array with a compile-time capacity. [`Stack`]
+//! holds a small handle to a run-time-sized lease borrowed from an [`Alloc`].
+//! Both expose their initialized values as a bottom-to-top slice and never grow.
+//! [`InlineStack::push`] and [`Stack::push`] silently discard values when full;
+//! [`InlineStack::try_push`] and [`Stack::try_push`] return rejected values.
+//!
+//! A [`TypedBlock`](crate::TypedBlock) is the simplest backing allocator when
+//! the element type and maximum capacity are known.
+//!
+//! ```rust
+//! use stackyard::{Stack, TypedBlock};
+//!
+//! let block = TypedBlock::<u8, 4>::new();
+//! let mut stack = Stack::<u8, _>::try_new_in(3, &block).unwrap();
+//! stack.push(1);
+//! stack.push(2);
+//! assert_eq!(stack.pop(), Some(2));
+//! ```
 
 use core::{
     alloc::Layout,
@@ -25,7 +44,8 @@ pub use inline_stack::InlineStack;
 ///
 /// The stack obtains one positive-sized allocation during construction and
 /// retains it until destruction. Its capacity never changes, and steady-state
-/// operations do not call the allocator.
+/// operations do not call the allocator. Its initialized values form a
+/// bottom-to-top prefix that can be accessed through slice operations.
 ///
 /// `Stack::push` silently drops a value when the stack is full, matching
 /// [`InlineStack::push`]; [`Stack::try_push`] returns the rejected value
@@ -45,9 +65,11 @@ pub struct Stack<'a, T, A: Alloc + ?Sized> {
 impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
     /// Attempts to allocate an empty stack with `capacity` slots.
     ///
-    /// Returns `None` if the array layout overflows or the allocator rejects
-    /// the request. Because allocators reject zero-sized layouts, zero
-    /// capacity and zero-sized element types are unsupported.
+    /// The stack borrows `allocator` until it is dropped. Returns `None` if the
+    /// array layout overflows or the allocator rejects the request, including
+    /// when its storage is already leased or too small. Because allocators
+    /// reject zero-sized layouts, zero capacity and zero-sized element types
+    /// are unsupported.
     #[inline]
     pub fn try_new_in(capacity: usize, allocator: &'a A) -> Option<Self> {
         let layout = Layout::array::<T>(capacity).ok()?;

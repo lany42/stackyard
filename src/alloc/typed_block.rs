@@ -1,6 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
-//! Typed single-block allocation.
+//! Reusable storage sized and aligned for one element type.
+//!
+//! [`TypedBlock<T, N>`](TypedBlock) reserves space for `N` values of `T` and
+//! implements [`Alloc`]. It grants one positive-sized lease at a time, so a
+//! collection must release its lease before the block can be reused.
+//! Its backing storage has exactly the space and alignment required for those
+//! values. Other element types are valid when their requested size and
+//! alignment fit within that storage, but using the same element type for the
+//! block and its collection is recommended.
+//!
+//! ```rust
+//! use stackyard::{Stack, TypedBlock};
+//!
+//! let block = TypedBlock::<u8, 2>::new();
+//! let mut stack = Stack::<u8, _>::try_new_in(2, &block).unwrap();
+//! stack.push(1);
+//! assert_eq!(stack.as_slice(), &[1]);
+//! ```
 
 use core::{
     alloc::Layout,
@@ -18,23 +35,23 @@ use super::{Alloc, sealed};
 /// never coexist. Zero-sized layouts are unsupported and return `None`.
 ///
 /// This allocator is intended to back collections whose element type is the
-/// same `T`. [`Layout`] erases Rust type identity, so `TypedBlock` cannot
-/// distinguish another type with an identical layout. A safe typed abstraction
-/// using this allocator must preserve the element-type relationship. The
-/// allocator still validates every request against the backing array's byte
-/// size and alignment; it never relies on type identity alone for memory
-/// safety.
+/// same `T`, and that pairing is recommended. Because [`Layout`] erases Rust
+/// type identity, `TypedBlock` may also accept another element type whose
+/// requested size and alignment fit within the backing array. Every request is
+/// validated against that array's byte size and alignment.
 ///
-/// A live positive-sized lease points into this value. The allocator must not
-/// be moved until that lease has been released or successfully grown. Safe
+/// A live positive-sized lease points into this value, so the allocator must
+/// not be moved until the lease is released. Successful growth replaces it
+/// with another live lease and does not permit moving the allocator. Safe
 /// collections enforce this by retaining a shared borrow of the `TypedBlock`.
+/// Releasing a lease or dropping the block does not drop values in its storage.
 pub struct TypedBlock<T, const N: usize> {
     slots: UnsafeCell<[MaybeUninit<T>; N]>,
     occupied: Cell<bool>,
 }
 
 impl<T, const N: usize> TypedBlock<T, N> {
-    /// Creates an unoccupied block.
+    /// Creates a block with no active lease.
     #[inline]
     pub const fn new() -> Self {
         Self {

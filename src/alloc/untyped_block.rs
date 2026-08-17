@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
-//! Untyped single-block allocation.
+//! Reusable byte storage for different layouts.
+//!
+//! [`UntypedBlock<N>`](UntypedBlock) reserves `N` bytes and implements
+//! [`Alloc`]. It aligns each request within those bytes and grants one
+//! positive-sized lease at a time. After a lease is released, the block can
+//! serve a different layout.
+//!
+//! ```rust
+//! use stackyard::{Stack, UntypedBlock};
+//!
+//! let block = UntypedBlock::<8>::new();
+//! let mut stack = Stack::<u8, _>::try_new_in(2, &block).unwrap();
+//! stack.push(1);
+//! assert_eq!(stack.as_slice(), &[1]);
+//! ```
 
 use core::{
     alloc::Layout,
@@ -24,17 +38,18 @@ use super::{Alloc, sealed};
 /// the `N` backing bytes. Consequently, a request can fail because of leading
 /// alignment padding even when `layout.size() <= N`.
 ///
-/// A live positive-sized lease points into this value. The allocator must not
-/// be moved until that lease has been released or successfully grown. Safe
-/// collections enforce this by retaining a shared borrow of the
-/// `UntypedBlock`.
+/// A live positive-sized lease points into this value, so the allocator must
+/// not be moved until the lease is released. Successful growth replaces it
+/// with another live lease and does not permit moving the allocator. Safe
+/// collections enforce this by retaining a shared borrow of the `UntypedBlock`.
+/// Releasing a lease or dropping the block does not drop values in its storage.
 pub struct UntypedBlock<const N: usize> {
     bytes: UnsafeCell<[MaybeUninit<u8>; N]>,
     occupied: Cell<bool>,
 }
 
 impl<const N: usize> UntypedBlock<N> {
-    /// Creates an unoccupied block.
+    /// Creates a block with no active lease.
     #[inline]
     pub const fn new() -> Self {
         Self {
