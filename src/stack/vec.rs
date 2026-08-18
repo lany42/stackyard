@@ -1,24 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
-//! Fixed-capacity last-in, first-out collections.
+//! Growable allocator-backed last-in, first-out collections.
 //!
-//! [`InlineStack`] owns an inline array with a compile-time capacity. [`Stack`]
-//! holds a small handle to a run-time-sized lease borrowed from an [`Alloc`].
-//! Both expose their initialized values as a bottom-to-top slice and never grow.
-//! [`InlineStack::push`] and [`Stack::push`] silently discard values when full;
-//! [`InlineStack::try_push`] and [`Stack::try_push`] return rejected values.
-//!
-//! A [`TypedBlock`](crate::TypedBlock) is the simplest backing allocator when
-//! the element type and maximum capacity are known.
+//! [`Vector`] borrows an [`Alloc`] and exposes its initialized values as a
+//! bottom-to-top slice. When a push or slice extension exceeds the current
+//! capacity, it attempts to grow the live allocation.
 //!
 //! ```rust
-//! use stackyard::{Stack, TypedBlock};
+//! use stackyard::{TypedBlock, Vector};
 //!
 //! let block = TypedBlock::<u8, 4>::new();
-//! let mut stack = Stack::<u8, _>::try_new_in(3, &block).unwrap();
-//! stack.push(1);
-//! stack.push(2);
-//! assert_eq!(stack.pop(), Some(2));
+//! let mut vector = Vector::<u8, _>::try_new_in(2, &block).unwrap();
+//! vector.push(1);
+//! vector.push(2);
+//! vector.push(3);
+//! assert_eq!(vector.pop(), Some(3));
 //! ```
 
 use core::{
@@ -36,27 +32,20 @@ use core::{
 
 use crate::Alloc;
 
-mod inline_stack;
-mod vec;
-
-pub use inline_stack::InlineStack;
-pub use vec::Vector;
-
-/// A fixed-capacity stack backed by a borrowed allocator.
+/// A growable last-in, first-out collection backed by a borrowed allocator.
 ///
-/// The stack obtains one positive-sized allocation during construction and
-/// retains it until destruction. Its capacity never changes, and steady-state
-/// operations do not call the allocator. Its initialized values form a
-/// bottom-to-top prefix that can be accessed through slice operations.
+/// The vector obtains one positive-sized allocation during construction and
+/// retains a live lease until destruction. Its initialized values form a
+/// bottom-to-top prefix that can be accessed through slice operations. Pushes
+/// and slice extensions use the allocator to grow that lease when necessary.
 ///
-/// `Stack::push` silently drops a value when the stack is full, matching
-/// [`InlineStack::push`]; [`Stack::try_push`] returns the rejected value
-/// instead. Dropping the stack destroys its initialized values and releases
-/// its allocation.
+/// [`Vector::try_push`] returns a rejected value when the allocation cannot
+/// grow. [`Vector::push`] instead silently drops that value. Dropping the
+/// vector destroys its initialized values and releases its current allocation.
 ///
 /// Zero capacity and zero-sized element types are unsupported because
 /// [`Alloc`] rejects zero-sized layouts.
-pub struct Stack<'a, T, A: Alloc + ?Sized> {
+pub struct Vector<'a, T, A: Alloc + ?Sized> {
     allocator: &'a A,
     ptr: NonNull<MaybeUninit<T>>,
     top: usize,
@@ -64,10 +53,10 @@ pub struct Stack<'a, T, A: Alloc + ?Sized> {
     _owns: PhantomData<T>,
 }
 
-impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
-    /// Attempts to allocate an empty stack with `capacity` slots.
+impl<'a, T, A: Alloc + ?Sized> Vector<'a, T, A> {
+    /// Attempts to allocate an empty vector with `capacity` slots.
     ///
-    /// The stack borrows `allocator` until it is dropped. Returns `None` if the
+    /// The vector borrows `allocator` until it is dropped. Returns `None` if the
     /// array layout overflows or the allocator rejects the request, including
     /// when its storage is already leased or too small. Because allocators
     /// reject zero-sized layouts, zero capacity and zero-sized element types
@@ -86,7 +75,75 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
         })
     }
 
-    /// Moves this stack handle into a [`Box`](crate::rust_alloc::boxed::Box).
+    /// Attempts the amortized growth needed for one additional value.
+    fn grow_one(&mut self) -> bool {
+        debug_assert!(self.is_full());
+
+        let old_capacity = self.capacity;
+        let Some(required_capacity) = old_capacity.checked_add(1) else {
+            return false;
+        };
+        let Some(doubled_capacity) = old_capacity.checked_mul(2) else {
+            return false;
+        };
+        let new_capacity = doubled_capacity.max(required_capacity);
+        let Some(new_layout) = Layout::array::<T>(new_capacity).ok() else {
+            return false;
+        };
+        let old_layout = Layout::array::<T>(old_capacity)
+            .expect("Vector capacity produced a valid layout during construction or growth");
+
+        // SAFETY:
+        // - `self.ptr` identifies this allocator's one live lease
+        // - `old_layout` is its exact current positive-sized layout
+        // - `new_layout` has the same alignment and is strictly larger
+        // - no references into the allocation are live across this call
+        let Some(new_ptr) =
+            (unsafe { self.allocator.grow(self.ptr.cast(), old_layout, new_layout) })
+        else {
+            return false;
+        };
+
+        self.ptr = new_ptr.cast();
+        self.capacity = new_capacity;
+        true
+    }
+
+    /// Attempts one amortized growth large enough for an entire slice.
+    fn grow_for_slice(&mut self, additional: usize) -> bool {
+        debug_assert!(additional > self.capacity - self.top);
+
+        let Some(required_capacity) = self.top.checked_add(additional) else {
+            return false;
+        };
+        let old_capacity = self.capacity;
+        let Some(doubled_capacity) = old_capacity.checked_mul(2) else {
+            return false;
+        };
+        let new_capacity = doubled_capacity.max(required_capacity);
+        let Some(new_layout) = Layout::array::<T>(new_capacity).ok() else {
+            return false;
+        };
+        let old_layout = Layout::array::<T>(old_capacity)
+            .expect("Vector capacity produced a valid layout during construction or growth");
+
+        // SAFETY:
+        // - `self.ptr` identifies this allocator's one live lease
+        // - `old_layout` is its exact current positive-sized layout
+        // - `new_layout` has the same alignment and is strictly larger
+        // - no references into the allocation are live across this call
+        let Some(new_ptr) =
+            (unsafe { self.allocator.grow(self.ptr.cast(), old_layout, new_layout) })
+        else {
+            return false;
+        };
+
+        self.ptr = new_ptr.cast();
+        self.capacity = new_capacity;
+        true
+    }
+
+    /// Moves this vector handle into a [`Box`](crate::rust_alloc::boxed::Box).
     ///
     /// The backing allocation remains owned by `allocator`; boxing moves only
     /// the handle.
@@ -96,11 +153,11 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
         crate::rust_alloc::boxed::Box::new(self)
     }
 
-    /// Moves the stack's values into a freshly allocated
+    /// Moves the vector's values into a freshly allocated
     /// [`Vec`](crate::rust_alloc::vec::Vec).
     ///
-    /// The vector is allocated with capacity for every stack slot and
-    /// preserves the values' bottom-to-top order. The stack's borrowed raw
+    /// The vector is allocated with capacity for every vector slot and
+    /// preserves the values' bottom-to-top order. The vector's borrowed raw
     /// allocation is released before this function returns.
     #[cfg(feature = "alloc")]
     #[inline]
@@ -119,94 +176,95 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
         }
 
         // Ownership of the initialized values now belongs to `vec`. Dropping
-        // the emptied Stack releases only its raw allocation.
+        // the emptied Vector releases only its raw allocation.
         self.top = 0;
         vec
     }
 
-    /// Returns the fixed number of values this stack can hold.
+    /// Returns the current number of values this vector can hold without growing.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Returns the number of values currently in the stack.
+    /// Returns the number of values currently in the vector.
     #[inline]
     pub fn len(&self) -> usize {
         self.top
     }
 
-    /// Returns `true` if the stack contains no values.
+    /// Returns `true` if the vector contains no values.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.top == 0
     }
 
-    /// Returns `true` if the stack can accept another value.
+    /// Returns `true` if the vector can accept another value without growing.
     #[inline]
     pub fn has_space(&self) -> bool {
         self.top < self.capacity
     }
 
-    /// Returns `true` if the stack is at capacity.
+    /// Returns `true` if the vector would need to grow before accepting a value.
     #[inline]
     pub fn is_full(&self) -> bool {
         self.top == self.capacity
     }
 
-    /// Attempts to push `value` onto the top of the stack.
+    /// Attempts to push `value` onto the top of the vector.
     ///
-    /// Returns `None` when `value` is stored. If the stack is full, returns
-    /// `Some(value)` and leaves the stack unchanged.
+    /// Returns `None` when `value` is stored. If the vector is full, first
+    /// attempts to grow its allocation. Returns `Some(value)` and leaves the
+    /// vector unchanged if growth fails.
     #[inline]
     pub fn try_push(&mut self, value: T) -> Option<T> {
         let top = self.top;
 
-        if top >= self.capacity {
-            Some(value)
-        } else {
-            // SAFETY:
-            // - construction obtained storage for exactly `capacity` values
-            // - the branch proves `top` is within that allocation
-            // - slots below `top` are initialized and this slot is not
-            // - `&mut self` grants exclusive access through the allocation
-            unsafe {
-                let end = self.ptr.as_ptr().add(top).cast::<T>();
-                ptr::write(end, value);
-                self.top = top + 1;
-            }
-            None
+        if top == self.capacity && !self.grow_one() {
+            return Some(value);
         }
+
+        // SAFETY:
+        // - either `top` was below capacity or `grow_one` enlarged the lease
+        // - slots below `top` are initialized and this slot is not
+        // - `&mut self` grants exclusive access through the allocation
+        unsafe {
+            let end = self.ptr.as_ptr().add(top).cast::<T>();
+            ptr::write(end, value);
+            self.top = top + 1;
+        }
+        None
     }
 
-    /// Pushes `value` onto the stack if space is available.
+    /// Pushes `value` onto the vector, growing its allocation when necessary.
     ///
-    /// If the stack is full, it remains unchanged and `value` is silently
-    /// dropped.
+    /// If required growth fails, the vector remains unchanged and `value` is
+    /// silently dropped.
     ///
     /// # Panics
     ///
-    /// Panics if the stack is full and `value`'s destructor panics while
-    /// discarding it. The stack itself remains unchanged.
+    /// Panics if growth fails and `value`'s destructor panics while discarding
+    /// it. The vector itself remains unchanged.
     #[inline]
     pub fn push(&mut self, value: T) {
         let top = self.top;
 
-        if top < self.capacity {
-            // SAFETY:
-            // - construction obtained storage for exactly `capacity` values
-            // - the branch proves `top` is within that allocation
-            // - slots below `top` are initialized and this slot is not
-            // - `&mut self` grants exclusive access through the allocation
-            unsafe {
-                let end = self.ptr.as_ptr().add(top).cast::<T>();
-                ptr::write(end, value);
-                self.top = top + 1;
-            }
+        if top == self.capacity && !self.grow_one() {
+            return;
+        }
+
+        // SAFETY:
+        // - either `top` was below capacity or `grow_one` enlarged the lease
+        // - slots below `top` are initialized and this slot is not
+        // - `&mut self` grants exclusive access through the allocation
+        unsafe {
+            let end = self.ptr.as_ptr().add(top).cast::<T>();
+            ptr::write(end, value);
+            self.top = top + 1;
         }
     }
 
-    /// Removes and returns the top value, or `None` if the stack is empty.
+    /// Removes and returns the top value, or `None` if the vector is empty.
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         let top = self.top;
@@ -227,7 +285,7 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
 
     /// Returns a reference to the top value without removing it.
     ///
-    /// Returns `None` when the stack is empty.
+    /// Returns `None` when the vector is empty.
     #[inline]
     pub fn last(&self) -> Option<&T> {
         if self.top == 0 {
@@ -263,14 +321,15 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<T>(), self.top) }
     }
 
-    /// Clones `value` onto the stack until it reaches capacity.
+    /// Clones `value` onto the vector until it reaches its current capacity.
     ///
-    /// Existing values remain in place.
+    /// Existing values remain in place. This operation does not grow the
+    /// allocation.
     ///
     /// # Panics
     ///
     /// Panics if [`T::clone`](Clone::clone) panics. Clones pushed before the
-    /// panic remain in the stack.
+    /// panic remain in the vector.
     #[inline]
     pub fn fill(&mut self, value: T)
     where
@@ -281,11 +340,11 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
         }
     }
 
-    /// Removes and drops all values in the stack.
+    /// Removes and drops all values in the vector.
     ///
     /// # Panics
     ///
-    /// Panics if a stored value's destructor panics. The stack is marked empty
+    /// Panics if a stored value's destructor panics. The vector is marked empty
     /// before values are dropped.
     #[inline]
     pub fn clear(&mut self) {
@@ -294,7 +353,7 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
         // SAFETY:
         // - `elements` is exactly the initialized prefix
         // - resetting `top` first transfers responsibility for that prefix to
-        //   this drop operation and prevents any later Stack drop from retrying
+        //   this drop operation and prevents any later Vector drop from retrying
         // - compiler-generated slice drop glue handles element destruction
         unsafe {
             self.top = 0;
@@ -302,10 +361,12 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
         }
     }
 
-    /// Copies as many values as fit from `src` onto the stack.
+    /// Copies all values from `src` onto the vector.
     ///
-    /// Returns the uncopied suffix when `src` exceeds the remaining capacity.
-    /// Returns `None` when `src` is empty or all of its values fit.
+    /// If the values do not fit, first attempts one amortized growth large
+    /// enough for the whole slice. Returns `Some(src)` and leaves the vector
+    /// unchanged if growth fails. Returns `None` for an empty or fully copied
+    /// slice.
     pub fn copy_from_slice<'b>(&mut self, src: &'b [T]) -> Option<&'b [T]>
     where
         T: Copy,
@@ -314,39 +375,34 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
             return None;
         }
 
-        if self.is_full() {
+        let current = self.top;
+        if src.len() > self.capacity - current && !self.grow_for_slice(src.len()) {
             return Some(src);
         }
 
-        let current = self.top;
-        let available = src.len().min(self.capacity - current);
-        let new_top = current + available;
-        let source = &src[..available];
+        let new_top = current + src.len();
 
         // SAFETY:
-        // - `available <= capacity - current`, so this range is in the lease
+        // - the slice fits either in the old lease or the successfully grown one
         // - the range starts at `top`, so every destination slot is uninitialized
         // - `&mut self` grants exclusive access to the destination range
         let destination =
-            unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr().add(current), available) };
-        destination.write_copy_of_slice(source);
+            unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr().add(current), src.len()) };
+        destination.write_copy_of_slice(src);
         self.top = new_top;
-
-        if available == src.len() {
-            None
-        } else {
-            Some(&src[available..])
-        }
+        None
     }
 
-    /// Clones as many values as fit from `src` onto the stack.
+    /// Clones all values from `src` onto the vector.
     ///
-    /// Returns the uncloned suffix when `src` exceeds the remaining capacity.
-    /// Returns `None` when `src` is empty or all of its values fit.
+    /// If the values do not fit, first attempts one amortized growth large
+    /// enough for the whole slice. Returns `Some(src)` without cloning and
+    /// leaves the vector unchanged if growth fails. Returns `None` for an empty
+    /// or fully cloned slice.
     ///
     /// # Panics
     ///
-    /// Panics if [`T::clone`](Clone::clone) panics. The stack retains the
+    /// Panics if [`T::clone`](Clone::clone) panics. The vector retains the
     /// contents it held before this call.
     pub fn clone_from_slice<'b>(&mut self, src: &'b [T]) -> Option<&'b [T]>
     where
@@ -356,37 +412,30 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
             return None;
         }
 
-        if self.is_full() {
+        let current = self.top;
+        if src.len() > self.capacity - current && !self.grow_for_slice(src.len()) {
             return Some(src);
         }
 
-        let current = self.top;
-        let available = src.len().min(self.capacity - current);
-        let new_top = current + available;
-        let source = &src[..available];
+        let new_top = current + src.len();
 
         // SAFETY:
-        // - `available <= capacity - current`, so this range is in the lease
+        // - the slice fits either in the old lease or the successfully grown one
         // - the range starts at `top`, so every destination slot is uninitialized
         // - `&mut self` grants exclusive access to the destination range
         let destination =
-            unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr().add(current), available) };
+            unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr().add(current), src.len()) };
 
         // If cloning panics, this operation drops its partially cloned prefix
         // and leaves `top` unchanged.
-        destination.write_clone_of_slice(source);
+        destination.write_clone_of_slice(src);
         self.top = new_top;
-
-        if available == src.len() {
-            None
-        } else {
-            Some(&src[available..])
-        }
+        None
     }
 
-    /// Clones this stack into a lease from `allocator`.
+    /// Clones this vector into a lease from `allocator`.
     ///
-    /// The destination preserves this stack's capacity and initialized prefix.
+    /// The destination preserves this vector's capacity and initialized prefix.
     /// Returns `None` without cloning any values if the destination layout
     /// overflows or `allocator` cannot grant a disjoint lease.
     ///
@@ -394,54 +443,54 @@ impl<'a, T, A: Alloc + ?Sized> Stack<'a, T, A> {
     ///
     /// Panics if [`T::clone`](Clone::clone) panics. The partially constructed
     /// destination drops every successful clone and releases its lease while
-    /// unwinding; this source stack remains unchanged.
-    pub fn try_clone_into<'b, B>(&self, allocator: &'b B) -> Option<Stack<'b, T, B>>
+    /// unwinding; this source vector remains unchanged.
+    pub fn try_clone_into<'b, B>(&self, allocator: &'b B) -> Option<Vector<'b, T, B>>
     where
         T: Clone,
         B: Alloc + ?Sized,
     {
-        let mut cloned = Stack::try_new_in(self.capacity, allocator)?;
+        let mut cloned = Vector::try_new_in(self.capacity, allocator)?;
         let remainder = cloned.clone_from_slice(self.as_slice());
         debug_assert!(remainder.is_none());
         Some(cloned)
     }
 }
 
-impl<'a, T: Hash, A: Alloc + ?Sized> Hash for Stack<'a, T, A> {
+impl<'a, T: Hash, A: Alloc + ?Sized> Hash for Vector<'a, T, A> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_slice().hash(state);
     }
 }
 
-impl<'a, 'b, T: PartialOrd, A: Alloc + ?Sized, B: Alloc + ?Sized> PartialOrd<Stack<'b, T, B>>
-    for Stack<'a, T, A>
+impl<'a, 'b, T: PartialOrd, A: Alloc + ?Sized, B: Alloc + ?Sized> PartialOrd<Vector<'b, T, B>>
+    for Vector<'a, T, A>
 {
     #[inline]
-    fn partial_cmp(&self, other: &Stack<'b, T, B>) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Vector<'b, T, B>) -> Option<Ordering> {
         self.as_slice().partial_cmp(other.as_slice())
     }
 }
 
-impl<'a, T: Ord, A: Alloc + ?Sized> Ord for Stack<'a, T, A> {
+impl<'a, T: Ord, A: Alloc + ?Sized> Ord for Vector<'a, T, A> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_slice().cmp(other.as_slice())
     }
 }
 
-impl<'a, 'b, T, U, A: Alloc + ?Sized, B: Alloc + ?Sized> PartialEq<Stack<'b, U, B>>
-    for Stack<'a, T, A>
+impl<'a, 'b, T, U, A: Alloc + ?Sized, B: Alloc + ?Sized> PartialEq<Vector<'b, U, B>>
+    for Vector<'a, T, A>
 where
     T: PartialEq<U>,
 {
     #[inline]
-    fn eq(&self, other: &Stack<'b, U, B>) -> bool {
+    fn eq(&self, other: &Vector<'b, U, B>) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<'a, T, U, A: Alloc + ?Sized> PartialEq<[U]> for Stack<'a, T, A>
+impl<'a, T, U, A: Alloc + ?Sized> PartialEq<[U]> for Vector<'a, T, A>
 where
     T: PartialEq<U>,
 {
@@ -451,7 +500,7 @@ where
     }
 }
 
-impl<'a, T, U, A: Alloc + ?Sized> PartialEq<&[U]> for Stack<'a, T, A>
+impl<'a, T, U, A: Alloc + ?Sized> PartialEq<&[U]> for Vector<'a, T, A>
 where
     T: PartialEq<U>,
 {
@@ -461,7 +510,7 @@ where
     }
 }
 
-impl<'a, T, U, A: Alloc + ?Sized, const N: usize> PartialEq<[U; N]> for Stack<'a, T, A>
+impl<'a, T, U, A: Alloc + ?Sized, const N: usize> PartialEq<[U; N]> for Vector<'a, T, A>
 where
     T: PartialEq<U>,
 {
@@ -471,7 +520,7 @@ where
     }
 }
 
-impl<'a, T, U, A: Alloc + ?Sized, const N: usize> PartialEq<&[U; N]> for Stack<'a, T, A>
+impl<'a, T, U, A: Alloc + ?Sized, const N: usize> PartialEq<&[U; N]> for Vector<'a, T, A>
 where
     T: PartialEq<U>,
 {
@@ -481,9 +530,9 @@ where
     }
 }
 
-impl<'a, T: Eq, A: Alloc + ?Sized> Eq for Stack<'a, T, A> {}
+impl<'a, T: Eq, A: Alloc + ?Sized> Eq for Vector<'a, T, A> {}
 
-impl<'a, T, A: Alloc + ?Sized, I> Index<I> for Stack<'a, T, A>
+impl<'a, T, A: Alloc + ?Sized, I> Index<I> for Vector<'a, T, A>
 where
     I: SliceIndex<[T]>,
 {
@@ -495,7 +544,7 @@ where
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized, I> IndexMut<I> for Stack<'a, T, A>
+impl<'a, T, A: Alloc + ?Sized, I> IndexMut<I> for Vector<'a, T, A>
 where
     I: SliceIndex<[T]>,
 {
@@ -505,49 +554,49 @@ where
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized> AsRef<[T]> for Stack<'a, T, A> {
+impl<'a, T, A: Alloc + ?Sized> AsRef<[T]> for Vector<'a, T, A> {
     #[inline]
     fn as_ref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized> AsMut<[T]> for Stack<'a, T, A> {
+impl<'a, T, A: Alloc + ?Sized> AsMut<[T]> for Vector<'a, T, A> {
     #[inline]
     fn as_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized> AsRef<Stack<'a, T, A>> for Stack<'a, T, A> {
+impl<'a, T, A: Alloc + ?Sized> AsRef<Vector<'a, T, A>> for Vector<'a, T, A> {
     #[inline]
-    fn as_ref(&self) -> &Stack<'a, T, A> {
+    fn as_ref(&self) -> &Vector<'a, T, A> {
         self
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized> AsMut<Stack<'a, T, A>> for Stack<'a, T, A> {
+impl<'a, T, A: Alloc + ?Sized> AsMut<Vector<'a, T, A>> for Vector<'a, T, A> {
     #[inline]
-    fn as_mut(&mut self) -> &mut Stack<'a, T, A> {
+    fn as_mut(&mut self) -> &mut Vector<'a, T, A> {
         self
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized> Borrow<[T]> for Stack<'a, T, A> {
+impl<'a, T, A: Alloc + ?Sized> Borrow<[T]> for Vector<'a, T, A> {
     #[inline]
     fn borrow(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized> BorrowMut<[T]> for Stack<'a, T, A> {
+impl<'a, T, A: Alloc + ?Sized> BorrowMut<[T]> for Vector<'a, T, A> {
     #[inline]
     fn borrow_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized> Deref for Stack<'a, T, A> {
+impl<'a, T, A: Alloc + ?Sized> Deref for Vector<'a, T, A> {
     type Target = [T];
 
     #[inline]
@@ -556,16 +605,16 @@ impl<'a, T, A: Alloc + ?Sized> Deref for Stack<'a, T, A> {
     }
 }
 
-impl<'a, T, A: Alloc + ?Sized> DerefMut for Stack<'a, T, A> {
+impl<'a, T, A: Alloc + ?Sized> DerefMut for Vector<'a, T, A> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
 }
 
-impl<'stack, 'alloc, T, A: Alloc + ?Sized> IntoIterator for &'stack Stack<'alloc, T, A> {
-    type Item = &'stack T;
-    type IntoIter = core::slice::Iter<'stack, T>;
+impl<'vector, 'alloc, T, A: Alloc + ?Sized> IntoIterator for &'vector Vector<'alloc, T, A> {
+    type Item = &'vector T;
+    type IntoIter = core::slice::Iter<'vector, T>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -573,9 +622,9 @@ impl<'stack, 'alloc, T, A: Alloc + ?Sized> IntoIterator for &'stack Stack<'alloc
     }
 }
 
-impl<'stack, 'alloc, T, A: Alloc + ?Sized> IntoIterator for &'stack mut Stack<'alloc, T, A> {
-    type Item = &'stack mut T;
-    type IntoIter = core::slice::IterMut<'stack, T>;
+impl<'vector, 'alloc, T, A: Alloc + ?Sized> IntoIterator for &'vector mut Vector<'alloc, T, A> {
+    type Item = &'vector mut T;
+    type IntoIter = core::slice::IterMut<'vector, T>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -592,17 +641,17 @@ struct ReleaseGuard<'a, A: Alloc + ?Sized> {
 impl<A: Alloc + ?Sized> Drop for ReleaseGuard<'_, A> {
     #[inline]
     fn drop(&mut self) {
-        // SAFETY: the guard is created from the Stack's one live lease with
+        // SAFETY: the guard is created from the Vector's one live lease with
         // its exact layout and is the sole owner of the release obligation.
         unsafe { self.allocator.free(self.ptr, self.layout) };
     }
 }
 
-impl<T, A: Alloc + ?Sized> Drop for Stack<'_, T, A> {
+impl<T, A: Alloc + ?Sized> Drop for Vector<'_, T, A> {
     #[inline]
     fn drop(&mut self) {
         let layout = Layout::array::<T>(self.capacity)
-            .expect("Stack capacity produced a valid layout during construction");
+            .expect("Vector capacity produced a valid layout during construction or growth");
 
         let release = ReleaseGuard {
             allocator: self.allocator,
@@ -639,7 +688,7 @@ mod tests {
         vec::Vec,
     };
 
-    use super::Stack;
+    use super::Vector;
 
     static COPY_CLONES: AtomicUsize = AtomicUsize::new(0);
 
@@ -677,76 +726,151 @@ mod tests {
     }
 
     #[test]
-    fn copy_from_slice_initializes_the_available_suffix_without_cloning() {
-        COPY_CLONES.store(0, Ordering::Relaxed);
-        let block = TypedBlock::<CountedCopy, 3>::new();
-        let mut stack = Stack::try_new_in(3, &block).expect("three values fit");
-        let input = [CountedCopy(10), CountedCopy(20), CountedCopy(30)];
-        assert_eq!(stack.try_push(CountedCopy(0)), None);
+    fn constructor_failures_leave_the_allocator_available() {
+        struct Zst;
 
-        assert_eq!(stack.copy_from_slice(&input), Some(&input[2..]));
+        let block = TypedBlock::<u8, 4>::new();
+
+        assert!(Vector::<u8, _>::try_new_in(0, &block).is_none());
+        assert!(Vector::<Zst, _>::try_new_in(1, &block).is_none());
+        assert!(Vector::<u16, _>::try_new_in(usize::MAX, &block).is_none());
+        assert!(Vector::<u8, _>::try_new_in(5, &block).is_none());
+
+        let vector = Vector::<u8, _>::try_new_in(4, &block)
+            .expect("the exact layout remains available after each failure");
+        assert_eq!(vector.capacity(), 4);
+    }
+
+    #[test]
+    fn copy_from_slice_grows_for_the_whole_input_without_cloning() {
+        COPY_CLONES.store(0, Ordering::Relaxed);
+        let block = TypedBlock::<CountedCopy, 7>::new();
+        let mut vector = Vector::try_new_in(2, &block).expect("two values fit initially");
+        let input = [
+            CountedCopy(10),
+            CountedCopy(20),
+            CountedCopy(30),
+            CountedCopy(40),
+            CountedCopy(50),
+            CountedCopy(60),
+        ];
+        assert_eq!(vector.try_push(CountedCopy(0)), None);
+
+        assert_eq!(vector.copy_from_slice(&input), None);
+        assert_eq!(vector.capacity(), 7);
         assert_eq!(
-            stack.as_slice(),
-            &[CountedCopy(0), CountedCopy(10), CountedCopy(20)]
+            vector.as_slice(),
+            &[
+                CountedCopy(0),
+                CountedCopy(10),
+                CountedCopy(20),
+                CountedCopy(30),
+                CountedCopy(40),
+                CountedCopy(50),
+                CountedCopy(60),
+            ]
         );
         assert_eq!(COPY_CLONES.load(Ordering::Relaxed), 0);
 
-        assert_eq!(stack.copy_from_slice(&input), Some(&input[..]));
+        let rejected = [CountedCopy(70)];
+        assert_eq!(vector.copy_from_slice(&rejected), Some(&rejected[..]));
+        assert_eq!(vector.len(), 7);
         assert_eq!(COPY_CLONES.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_bulk_copy_leaves_available_slots_and_input_untouched() {
+        let block = TypedBlock::<u8, 5>::new();
+        let mut vector =
+            Vector::<u8, _>::try_new_in(3, &block).expect("three values fit initially");
+        let input = [10, 20, 30];
+        vector.push(1);
+
+        assert_eq!(vector.copy_from_slice(&input), Some(&input[..]));
+        assert_eq!(vector.capacity(), 3);
+        assert_eq!(vector.as_slice(), [1]);
     }
 
     #[test]
     fn try_push_pop_and_drop_transfer_each_value_exactly_once() {
         let drops = Rc::new(Cell::new(0));
-        let block = TypedBlock::<SmokeTracked, 3>::new();
-        let mut stack = Stack::try_new_in(3, &block).expect("three values fit");
+        let block = TypedBlock::<SmokeTracked, 5>::new();
+        let mut vector =
+            Vector::<SmokeTracked, _>::try_new_in(2, &block).expect("two values fit initially");
 
         assert_eq!(
             (
-                stack.capacity(),
-                stack.len(),
-                stack.is_empty(),
-                stack.has_space(),
-                stack.is_full(),
+                vector.capacity(),
+                vector.len(),
+                vector.is_empty(),
+                vector.has_space(),
+                vector.is_full(),
             ),
-            (3, 0, true, true, false)
+            (2, 0, true, true, false)
         );
-        assert!(stack.as_slice().is_empty());
-        assert!(stack.last().is_none());
+        assert!(vector.as_slice().is_empty());
+        assert!(vector.last().is_none());
 
-        assert!(stack.try_push(SmokeTracked::new(10, &drops)).is_none());
-        stack.push(SmokeTracked::new(20, &drops));
-        assert!(stack.try_push(SmokeTracked::new(30, &drops)).is_none());
+        assert!(vector.try_push(SmokeTracked::new(10, &drops)).is_none());
+        vector.push(SmokeTracked::new(20, &drops));
+        assert!(vector.try_push(SmokeTracked::new(30, &drops)).is_none());
+        assert_eq!(vector.capacity(), 4);
         assert_eq!(
-            stack
+            vector
                 .as_slice()
                 .iter()
                 .map(|tracked| tracked.value)
                 .collect::<Vec<_>>(),
             [10, 20, 30]
         );
-        assert_eq!(stack.last().map(|tracked| tracked.value), Some(30));
+        assert_eq!(vector.last().map(|tracked| tracked.value), Some(30));
         assert_eq!(
             (
-                stack.len(),
-                stack.is_empty(),
-                stack.has_space(),
-                stack.is_full(),
+                vector.len(),
+                vector.is_empty(),
+                vector.has_space(),
+                vector.is_full(),
             ),
-            (3, false, false, true)
+            (3, false, true, false)
         );
 
-        let rejected = stack
-            .try_push(SmokeTracked::new(40, &drops))
-            .expect("a full stack returns the rejected value");
-        assert_eq!(rejected.value, 40);
+        vector.push(SmokeTracked::new(40, &drops));
+        assert!(vector.is_full());
+
+        let rejected = vector
+            .try_push(SmokeTracked::new(50, &drops))
+            .expect("failed exponential growth returns the rejected value");
+        assert_eq!(rejected.value, 50);
         drop(rejected);
         assert_eq!(drops.get(), 1);
 
-        stack.push(SmokeTracked::new(50, &drops));
+        vector.push(SmokeTracked::new(60, &drops));
         assert_eq!(drops.get(), 2);
         assert_eq!(
-            stack
+            vector
+                .as_slice()
+                .iter()
+                .map(|tracked| tracked.value)
+                .collect::<Vec<_>>(),
+            [10, 20, 30, 40]
+        );
+
+        let popped = vector.pop().expect("the vector is not empty");
+        assert_eq!(popped.value, 40);
+        drop(popped);
+        assert_eq!(drops.get(), 3);
+        assert_eq!(vector.last().map(|tracked| tracked.value), Some(30));
+        assert_eq!(
+            (
+                vector.len(),
+                vector.is_empty(),
+                vector.has_space(),
+                vector.is_full(),
+            ),
+            (3, false, true, false)
+        );
+        assert_eq!(
+            vector
                 .as_slice()
                 .iter()
                 .map(|tracked| tracked.value)
@@ -754,34 +878,11 @@ mod tests {
             [10, 20, 30]
         );
 
-        let popped = stack.pop().expect("the stack is not empty");
-        assert_eq!(popped.value, 30);
-        drop(popped);
-        assert_eq!(drops.get(), 3);
-        assert_eq!(stack.last().map(|tracked| tracked.value), Some(20));
-        assert_eq!(
-            (
-                stack.len(),
-                stack.is_empty(),
-                stack.has_space(),
-                stack.is_full(),
-            ),
-            (2, false, true, false)
-        );
-        assert_eq!(
-            stack
-                .as_slice()
-                .iter()
-                .map(|tracked| tracked.value)
-                .collect::<Vec<_>>(),
-            [10, 20]
-        );
+        drop(vector);
+        assert_eq!(drops.get(), 6);
 
-        drop(stack);
-        assert_eq!(drops.get(), 5);
-
-        let reused = Stack::<SmokeTracked, _>::try_new_in(3, &block)
-            .expect("normal destruction releases the allocation");
+        let reused = Vector::<SmokeTracked, _>::try_new_in(5, &block)
+            .expect("destruction releases the final grown allocation");
         drop(reused);
     }
 
@@ -790,12 +891,13 @@ mod tests {
     fn into_vec_moves_values_in_order_and_preserves_capacity() {
         let drops = Rc::new(Cell::new(0));
         let block = TypedBlock::<SmokeTracked, 4>::new();
-        let mut stack = Stack::try_new_in(4, &block).expect("four values fit");
+        let mut vector = Vector::try_new_in(2, &block).expect("two values fit initially");
         for value in [10, 20, 30] {
-            assert!(stack.try_push(SmokeTracked::new(value, &drops)).is_none());
+            assert!(vector.try_push(SmokeTracked::new(value, &drops)).is_none());
         }
+        assert_eq!(vector.capacity(), 4);
 
-        let vec = stack.into_vec();
+        let vec = vector.into_vec();
 
         assert_eq!(
             vec.iter().map(|tracked| tracked.value).collect::<Vec<_>>(),
@@ -804,7 +906,7 @@ mod tests {
         assert!(vec.capacity() >= 4);
         assert_eq!(drops.get(), 0);
 
-        let reused = Stack::<SmokeTracked, _>::try_new_in(4, &block)
+        let reused = Vector::<SmokeTracked, _>::try_new_in(4, &block)
             .expect("conversion releases the borrowed allocation");
         drop(reused);
 
@@ -813,28 +915,85 @@ mod tests {
     }
 
     #[test]
-    fn clone_from_slice_returns_remainder_and_cross_allocator_clone_is_independent() {
-        let block = TypedBlock::<String, 3>::new();
-        let clone_block = TypedBlock::<String, 3>::new();
-        let mut stack = Stack::try_new_in(3, &block).expect("three strings fit");
-        assert!(stack.try_push(String::from("existing")).is_none());
+    fn clone_from_slice_grows_and_cross_allocator_clone_is_independent() {
+        let block = TypedBlock::<String, 6>::new();
+        let clone_block = TypedBlock::<String, 6>::new();
+        let mut vector = Vector::try_new_in(3, &block).expect("three strings fit initially");
+        assert!(vector.try_push(String::from("existing")).is_none());
         let input = [
             String::from("left"),
             String::from("right"),
             String::from("remainder"),
         ];
 
-        assert_eq!(stack.clone_from_slice(&input), Some(&input[2..]));
-        assert_eq!(stack.as_slice(), ["existing", "left", "right"]);
-        assert_eq!(stack.clone_from_slice(&[]), None);
-        assert_eq!(stack.clone_from_slice(&input[..1]), Some(&input[..1]));
+        assert_eq!(vector.clone_from_slice(&input), None);
+        assert_eq!(vector.capacity(), 6);
+        assert_eq!(
+            vector.as_slice(),
+            ["existing", "left", "right", "remainder"]
+        );
+        assert_eq!(vector.clone_from_slice(&[]), None);
+        assert_eq!(vector.clone_from_slice(&input), Some(&input[..]));
+        assert_eq!(vector.len(), 4);
 
-        let cloned = stack
+        let cloned = vector
             .try_clone_into(&clone_block)
             .expect("the second block grants a disjoint lease");
-        stack.as_mut_slice()[0].push('!');
-        assert_eq!(stack.as_slice(), ["existing!", "left", "right"]);
-        assert_eq!(cloned.as_slice(), ["existing", "left", "right"]);
+        vector.as_mut_slice()[0].push('!');
+        assert_eq!(
+            vector.as_slice(),
+            ["existing!", "left", "right", "remainder"]
+        );
+        assert_eq!(
+            cloned.as_slice(),
+            ["existing", "left", "right", "remainder"]
+        );
+    }
+
+    struct CountedClone {
+        value: u8,
+        clones: Rc<Cell<usize>>,
+    }
+
+    impl Clone for CountedClone {
+        fn clone(&self) -> Self {
+            self.clones.set(self.clones.get() + 1);
+            Self {
+                value: self.value,
+                clones: Rc::clone(&self.clones),
+            }
+        }
+    }
+
+    #[test]
+    fn failed_bulk_clone_returns_the_entire_input_without_cloning() {
+        let clones = Rc::new(Cell::new(0));
+        let block = TypedBlock::<CountedClone, 5>::new();
+        let mut vector = Vector::try_new_in(3, &block).expect("three values fit initially");
+        vector.push(CountedClone {
+            value: 1,
+            clones: Rc::clone(&clones),
+        });
+        let input = [10, 20, 30].map(|value| CountedClone {
+            value,
+            clones: Rc::clone(&clones),
+        });
+
+        let rejected = vector
+            .clone_from_slice(&input)
+            .expect("growth to six exceeds the five-slot allocator");
+
+        assert!(core::ptr::eq(rejected, input.as_slice()));
+        assert_eq!(clones.get(), 0);
+        assert_eq!(vector.capacity(), 3);
+        assert_eq!(
+            vector
+                .as_slice()
+                .iter()
+                .map(|value| value.value)
+                .collect::<Vec<_>>(),
+            [1]
+        );
     }
 
     struct PanickingClone {
@@ -862,9 +1021,9 @@ mod tests {
     fn clone_from_slice_rolls_back_only_the_new_suffix_on_panic() {
         let drops = Rc::new(Cell::new(0));
         let block = TypedBlock::<PanickingClone, 3>::new();
-        let mut stack = Stack::try_new_in(3, &block).expect("three values fit");
+        let mut vector = Vector::try_new_in(1, &block).expect("one value fits initially");
         assert!(
-            stack
+            vector
                 .try_push(PanickingClone {
                     panic_on_clone: false,
                     drops: Rc::clone(&drops),
@@ -882,14 +1041,15 @@ mod tests {
             },
         ];
 
-        let result = catch_unwind(AssertUnwindSafe(|| stack.clone_from_slice(&input)));
+        let result = catch_unwind(AssertUnwindSafe(|| vector.clone_from_slice(&input)));
 
         assert!(result.is_err());
-        assert_eq!(stack.len(), 1);
-        assert!(!stack.as_slice()[0].panic_on_clone);
+        assert_eq!(vector.capacity(), 3);
+        assert_eq!(vector.len(), 1);
+        assert!(!vector.as_slice()[0].panic_on_clone);
         assert_eq!(drops.get(), 1);
 
-        drop(stack);
+        drop(vector);
         assert_eq!(drops.get(), 2);
         drop(input);
         assert_eq!(drops.get(), 4);
@@ -909,30 +1069,30 @@ mod tests {
         }
 
         let block = TypedBlock::<Stored, 4>::new();
-        let mut stack = Stack::try_new_in(4, &block).expect("four values fit");
+        let mut vector = Vector::try_new_in(4, &block).expect("four values fit");
         for value in [1, 2, 3] {
-            assert!(stack.try_push(Stored(value)).is_none());
+            assert!(vector.try_push(Stored(value)).is_none());
         }
 
         let array = [Compared(1), Compared(2), Compared(3)];
         let slice = array.as_slice();
 
-        assert!(stack == *slice);
-        assert!(stack == slice);
-        assert!(stack == array);
-        assert!(stack == &array);
+        assert!(vector == *slice);
+        assert!(vector == slice);
+        assert!(vector == array);
+        assert!(vector == &array);
 
         let different = [Compared(1), Compared(2), Compared(4)];
-        assert!(stack != different);
-        assert!(stack != &different[..2]);
+        assert!(vector != different);
+        assert!(vector != &different[..2]);
     }
 
     #[test]
     fn slice_trait_forwarding_uses_only_the_initialized_prefix() {
         let left_block = TypedBlock::<u8, 4>::new();
         let right_block = TypedBlock::<u8, 4>::new();
-        let mut left = Stack::try_new_in(4, &left_block).expect("four values fit");
-        let mut right = Stack::try_new_in(4, &right_block).expect("four values fit");
+        let mut left = Vector::try_new_in(4, &left_block).expect("four values fit");
+        let mut right = Vector::try_new_in(4, &right_block).expect("four values fit");
         assert!(left.as_slice().is_empty());
         left.copy_from_slice(&[1, 2, 3]);
         right.copy_from_slice(&[1, 2, 3]);
@@ -994,24 +1154,38 @@ mod tests {
     }
 
     #[test]
+    fn fill_stops_at_the_current_capacity_without_growing() {
+        let block = TypedBlock::<u8, 8>::new();
+        let mut vector = Vector::<u8, _>::try_new_in(2, &block).expect("two values fit initially");
+
+        vector.fill(7);
+
+        assert_eq!(vector.capacity(), 2);
+        assert_eq!(vector.as_slice(), [7, 7]);
+        assert_eq!(vector.try_push(8), None);
+        assert_eq!(vector.capacity(), 4);
+        assert_eq!(vector.as_slice(), [7, 7, 8]);
+    }
+
+    #[test]
     fn fill_leaves_successful_clones_initialized_when_a_later_clone_panics() {
         let clone_calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
         let block = TypedBlock::<PanicAfterOneClone, 3>::new();
-        let mut stack = Stack::try_new_in(3, &block).expect("three values fit");
+        let mut vector = Vector::try_new_in(3, &block).expect("three values fit");
         let value = PanicAfterOneClone {
             clone_calls: Rc::clone(&clone_calls),
             drops: Rc::clone(&drops),
         };
 
-        let result = catch_unwind(AssertUnwindSafe(|| stack.fill(value)));
+        let result = catch_unwind(AssertUnwindSafe(|| vector.fill(value)));
 
         assert!(result.is_err());
         assert_eq!(clone_calls.get(), 2);
-        assert_eq!(stack.len(), 1);
+        assert_eq!(vector.len(), 1);
         assert_eq!(drops.get(), 1);
 
-        drop(stack);
+        drop(vector);
         assert_eq!(drops.get(), 2);
     }
 
@@ -1030,11 +1204,11 @@ mod tests {
     #[test]
     fn clear_invalidates_the_prefix_before_a_destructor_panics() {
         let drops = Rc::new(Cell::new(0));
-        let block = TypedBlock::<PanickingDrop, 3>::new();
-        let mut stack = Stack::try_new_in(3, &block).expect("three values fit");
+        let block = TypedBlock::<PanickingDrop, 4>::new();
+        let mut vector = Vector::try_new_in(1, &block).expect("one value fits initially");
         for panic_on_drop in [true, false, false] {
             assert!(
-                stack
+                vector
                     .try_push(PanickingDrop {
                         panic_on_drop,
                         drops: Rc::clone(&drops),
@@ -1042,17 +1216,18 @@ mod tests {
                     .is_none()
             );
         }
+        assert_eq!(vector.capacity(), 4);
 
-        let result = catch_unwind(AssertUnwindSafe(|| stack.clear()));
+        let result = catch_unwind(AssertUnwindSafe(|| vector.clear()));
 
         assert!(result.is_err());
-        assert!(stack.is_empty());
+        assert!(vector.is_empty());
         let dropped_during_clear = drops.get();
         assert!(dropped_during_clear > 0);
 
         for _ in 0..3 {
             assert!(
-                stack
+                vector
                     .try_push(PanickingDrop {
                         panic_on_drop: false,
                         drops: Rc::clone(&drops),
@@ -1061,7 +1236,7 @@ mod tests {
             );
         }
 
-        drop(stack);
+        drop(vector);
         assert_eq!(drops.get(), dropped_during_clear + 3);
     }
 }

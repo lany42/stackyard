@@ -3,3 +3,6 @@
 
 #[path = "untyped_block/stack.rs"]
 mod stack;
+
+#[path = "untyped_block/vector.rs"]
+mod vector;

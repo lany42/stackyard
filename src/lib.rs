@@ -83,4 +83,4 @@ pub mod alloc;
 mod stack;
 
 pub use alloc::{Alloc, TypedBlock, UntypedBlock};
-pub use stack::{InlineStack, Stack};
+pub use stack::{InlineStack, Stack, Vector};
