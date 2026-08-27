@@ -37,9 +37,13 @@ use core::{
 use crate::Alloc;
 
 mod inline_stack;
+#[cfg(feature = "alloc")]
+mod small_vec;
 mod vec;
 
 pub use inline_stack::InlineStack;
+#[cfg(feature = "alloc")]
+pub use small_vec::{SmallVec, SmallVec8, SmallVec16};
 pub use vec::Vector;
 
 /// A fixed-capacity stack backed by a borrowed allocator.

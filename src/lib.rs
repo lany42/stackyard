@@ -10,6 +10,8 @@
 //! chooses its capacity at run time. [`TypedBlock`] provides storage for a fixed
 //! number of one type, while [`UntypedBlock`] provides a fixed number of bytes
 //! that may be reused for different layouts.
+//! With the `alloc` feature, `SmallVec` keeps an inline prefix and grows through
+//! allocator-backed spillover only after that prefix is full.
 //!
 //! Both stack types preserve insertion order when viewed as a slice and remove
 //! values in last-in, first-out order. Their capacity never grows.
@@ -67,8 +69,9 @@
 //!
 //! ## Feature Flags
 //!
-//! - `alloc` *(default)* — enables the `Box` and `Vec` convenience APIs. All
-//!   fixed-capacity stacks and block allocators remain available without it.
+//! - `alloc` *(default)* — enables the `Box`, `Vec`, and `SmallVec` convenience
+//!   APIs. All fixed-capacity stacks and block allocators remain available
+//!   without it.
 //!
 //! ## License
 //!
@@ -84,3 +87,5 @@ mod stack;
 
 pub use alloc::{Alloc, TypedBlock, UntypedBlock};
 pub use stack::{InlineStack, Stack, Vector};
+#[cfg(feature = "alloc")]
+pub use stack::{SmallVec, SmallVec8, SmallVec16};

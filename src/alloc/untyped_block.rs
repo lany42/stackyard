@@ -38,6 +38,17 @@ use super::{Alloc, sealed};
 /// the `N` backing bytes. Consequently, a request can fail because of leading
 /// alignment padding even when `layout.size() <= N`.
 ///
+/// # Growth
+///
+/// Growth is in place only. `UntypedBlock` derives the first suitably aligned
+/// interior pointer for the new layout and succeeds only if that pointer is the
+/// current lease's address and the enlarged range fits. Retaining the layout's
+/// alignment preserves this address; changing it can cause growth to fail even
+/// when another suitably aligned range would fit within the backing bytes.
+/// `UntypedBlock` does not relocate leased bytes during growth.
+/// Callers can emulate such growth only by buffering their data locally before
+/// freeing the lease, then allocating the new layout and restoring the data.
+///
 /// A live positive-sized lease points into this value, so the allocator must
 /// not be moved until the lease is released. Successful growth replaces it
 /// with another live lease and does not permit moving the allocator. Safe
