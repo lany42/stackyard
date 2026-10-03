@@ -1,0 +1,29 @@
+name: Mirror canonical repository
+
+# Enable MIRROR_ENABLED only after origin contains every intended commit and tag.
+# REPO_MIRROR is a fine-grained PAT with Contents/Workflows write access to this mirror.
+on:
+  schedule:
+    - cron: "47 */6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: canonical-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: ${{ github.repository == 'lany42/stackyard' && vars.MIRROR_ENABLED == 'true' }}
+    permissions:
+      actions: write # only for dispatch-workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Mirror canonical repository
+        uses: lany42/lany-actions-ci/actions/mirror@13d58427af33163866b2e7cc5da3b0ecebf0e3c7 # v1.1.0
+        with:
+          canonical-url: https://git.colorized.life/stackyard.git
+          token: ${{ secrets.REPO_MIRROR }}
+          dispatch-workflow: preflight.yml

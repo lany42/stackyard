@@ -8,7 +8,7 @@ readme = "README.md"
 repository = "https://git.colorized.life/stackyard"
 keywords = ["no_std", "data-structures", "no-heap", "embedded", "algorithms"]
 categories = ["data-structures", "no-std"]
-exclude = ["/.gitignore"]
+exclude = ["/.github", "/.gitignore"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -1,0 +1,19 @@
+name: Rust preflight
+
+# The mirror dispatches this workflow on main after a verified synchronization.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-preflight
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    uses: lany42/lany-actions-ci/.github/workflows/rust-preflight.yml@13d58427af33163866b2e7cc5da3b0ecebf0e3c7 # v1.1.0
+    with:
+      freestanding-target: thumbv7em-none-eabi
+      miri-script: scripts/test-miri
