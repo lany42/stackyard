@@ -1,5 +1,7 @@
 # stackyard
 
+The canonical home of this repository is at https://git.colorized.life/stackyard/
+
 Freestanding data structures and algorithms.
 
 ## Installation
